@@ -66,6 +66,8 @@ to the host.
    To forward Motd typing notifications to Discord, set
    `typing-send-enabled = yes` under `[irc]` in `config/rdircd.ini`. This is
    deliberately off by default because typing status is presence information.
+   The project defaults also leave Discord presence unchanged and do not mark
+   DMs read; enable `status-set` or `msg-ack` explicitly if wanted.
 
 4. For an Ergo server using a private CA, install its public certificate and
    enable the optional mount:
