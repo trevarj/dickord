@@ -226,6 +226,17 @@ func TestErgoIntegration(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Discord reaction-to-IRC translation timed out")
 	}
+	fake.SendReaction(testDiscordMessageID, "Bob", "-👍", "Alice", "hello from Discord")
+	select {
+	case msg := <-ownerMessages:
+		_, reply := msg.GetTag("+reply")
+		_, reaction := msg.GetTag("+unreact")
+		if msg.Command != "TAGMSG" || reply != ircMessageID || reaction != "👍" {
+			t.Fatalf("unexpected native unreaction: command=%q reply=%q reaction=%q", msg.Command, reply, reaction)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Discord unreaction-to-IRC translation timed out")
+	}
 
 	bridge.relayReactionWithRetry(
 		"#discord.me.chat.alice", "Bob", discordReaction{add: true, emoji: "❓"},
@@ -278,6 +289,24 @@ func TestErgoIntegration(t *testing.T) {
 	select {
 	case msg := <-ownerMessages:
 		t.Fatalf("Discord reaction confirmation was duplicated onto IRC: %+v", msg)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	if err := owner.SendWithTags(map[string]string{"+reply": ircMessageID, "+draft/unreact": ":Party:"}, "TAGMSG", "#discord.me.chat.alice"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case reaction := <-fake.reactions:
+		if reaction.replyID != testDiscordMessageID || reaction.emoji != ":Party:" || reaction.add {
+			t.Fatalf("unexpected custom IRC-to-Discord unreaction: %+v", reaction)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("custom IRC unreaction-to-Discord translation timed out")
+	}
+	fake.SendReaction(testDiscordMessageID, "owner", "-:Party:", "Alice", "hello from Discord")
+	select {
+	case msg := <-ownerMessages:
+		t.Fatalf("custom Discord unreaction confirmation was duplicated onto IRC: %+v", msg)
 	case <-time.After(300 * time.Millisecond):
 	}
 
