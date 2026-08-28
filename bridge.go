@@ -1262,6 +1262,7 @@ func (b *Bridge) onErgoMessage(conn *ircevent.Connection, msg ircmsg.Message) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
+	text = translateRelayAddress(text)
 	_, ergoMsgID := msg.GetTag("msgid")
 	for index, line := range splitUTF8(text, 380) {
 		tags := make(map[string]string, 2)
@@ -1304,6 +1305,14 @@ func authorizedMessage(msg ircmsg.Message, owners map[string]struct{}) (account,
 		return account, "unauthorized-account", false
 	}
 	return account, "", true
+}
+
+func translateRelayAddress(text string) string {
+	nick, rest, found := strings.Cut(text, "/discord:")
+	if !found || nick == "" || strings.ContainsAny(nick, " \t") {
+		return text
+	}
+	return "@" + nick + " " + strings.TrimLeft(rest, " \t")
 }
 
 func topicCommand(text string) (string, bool) {

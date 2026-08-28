@@ -165,6 +165,20 @@ func TestReactionTags(t *testing.T) {
 	}
 }
 
+func TestRelayAddressTranslation(t *testing.T) {
+	tests := map[string]string{
+		"Crispy/discord: hi":       "@Crispy hi",
+		"Crispy/discord:hi":        "@Crispy hi",
+		"hello Crispy/discord: hi": "hello Crispy/discord: hi",
+		"Crispy: hi":               "Crispy: hi",
+	}
+	for input, expected := range tests {
+		if actual := translateRelayAddress(input); actual != expected {
+			t.Errorf("translateRelayAddress(%q)=%q, want %q", input, actual, expected)
+		}
+	}
+}
+
 func TestTopicCommand(t *testing.T) {
 	tests := []struct {
 		input string
