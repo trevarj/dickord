@@ -26,6 +26,11 @@ type discordRefKey struct {
 	messageID string
 }
 
+type discordUserKey struct {
+	source string
+	nick   string
+}
+
 type pendingRelay struct {
 	destination string
 	nick        string
@@ -76,7 +81,9 @@ type Bridge struct {
 	messageRefs      map[messageRefKey]string
 	messageRefOrder  []messageRefKey
 	discordRefs      map[string]discordMessageRef
-	ergoByDiscord    map[discordRefKey]string
+	ergoByDiscord    map[discordRefKey][]string
+	discordRefOrder  []discordRefKey
+	discordUsers     map[discordUserKey]string
 	pendingReactions map[pendingDiscordReaction]time.Time
 	pendingDeletions map[discordRefKey]time.Time
 }
@@ -93,7 +100,8 @@ func newBridge(cfg RuntimeConfig, logger *slog.Logger) *Bridge {
 		pendingRelays:    make(map[string]pendingRelay),
 		messageRefs:      make(map[messageRefKey]string),
 		discordRefs:      make(map[string]discordMessageRef),
-		ergoByDiscord:    make(map[discordRefKey]string),
+		ergoByDiscord:    make(map[discordRefKey][]string),
+		discordUsers:     make(map[discordUserKey]string),
 		pendingReactions: make(map[pendingDiscordReaction]time.Time),
 		pendingDeletions: make(map[discordRefKey]time.Time),
 	}
@@ -528,11 +536,49 @@ func (b *Bridge) onRDirCDTagMessage(conn *ircevent.Connection, msg ircmsg.Messag
 	}
 	b.mu.Lock()
 	if b.rdircd == conn {
-		ref := discordMessageRef{source: msg.Params[0], messageID: discordMsgID}
-		b.discordRefs[ergoMsgID] = ref
-		b.ergoByDiscord[discordRefKey{source: ircCasefold(ref.source), messageID: ref.messageID}] = ergoMsgID
+		b.cacheDiscordRefLocked(ergoMsgID, discordMessageRef{source: msg.Params[0], messageID: discordMsgID})
 	}
 	b.mu.Unlock()
+}
+
+func (b *Bridge) discordRefLimitLocked() int {
+	mapped := len(b.sourceToDest)
+	if _, control := b.sourceToDest[ircCasefold("#rdircd.control")]; control {
+		mapped--
+	}
+	return max(4096, min(65536, b.cfg.Channels.CatchUpLimit*max(1, mapped)))
+}
+
+func (b *Bridge) cacheDiscordRefLocked(ergoMsgID string, ref discordMessageRef) {
+	if ergoMsgID == "" || ref.source == "" || !validDiscordID(ref.messageID) {
+		return
+	}
+	key := discordRefKey{source: ircCasefold(ref.source), messageID: ref.messageID}
+	if old := b.discordRefs[ergoMsgID]; old.messageID != "" {
+		oldKey := discordRefKey{source: ircCasefold(old.source), messageID: old.messageID}
+		if oldKey == key {
+			return
+		}
+	}
+	b.discordRefs[ergoMsgID] = ref
+	ids, exists := b.ergoByDiscord[key]
+	if !exists {
+		b.discordRefOrder = append(b.discordRefOrder, key)
+	}
+	for _, existing := range ids {
+		if existing == ergoMsgID {
+			return
+		}
+	}
+	b.ergoByDiscord[key] = append(ids, ergoMsgID)
+	for len(b.discordRefOrder) > b.discordRefLimitLocked() {
+		oldest := b.discordRefOrder[0]
+		b.discordRefOrder = b.discordRefOrder[1:]
+		for _, id := range b.ergoByDiscord[oldest] {
+			delete(b.discordRefs, id)
+		}
+		delete(b.ergoByDiscord, oldest)
+	}
 }
 
 func (b *Bridge) onRDirCDTopic(conn *ircevent.Connection, msg ircmsg.Message) {
@@ -641,23 +687,51 @@ func (b *Bridge) onRDirCDMessage(conn *ircevent.Connection, msg ircmsg.Message, 
 	if nick == "" {
 		nick = "discord"
 	}
+	if _, userID := msg.GetTag("+dickord/discord-userid"); validDiscordID(userID) {
+		b.mu.Lock()
+		b.discordUsers[discordUserKey{source: ircCasefold(target), nick: ircCasefold(nick)}] = userID
+		b.mu.Unlock()
+	}
 	if self, value := msg.GetTag("+dickord/self"); self && value == "1" && len(b.cfg.Ergo.OwnerAccounts) > 0 {
 		nick = b.cfg.Ergo.OwnerAccounts[0]
 	}
-	if isDiscordDeletion(text) {
-		_, discordMessageID := msg.GetTag("+dickord/discord-msgid")
-		if discordMessageID != "" {
+	_, event := msg.GetTag("+dickord/event")
+	_, discordMessageID := msg.GetTag("+dickord/discord-msgid")
+	switch event {
+	case "delete":
+		if validDiscordID(discordMessageID) {
 			b.relayRedactionWithRetry(destination, 50, target, discordMessageID)
+		}
+		return
+	case "react-add", "react-remove":
+		_, emoji := msg.GetTag("+dickord/emoji")
+		if emoji == "" || !validDiscordID(discordMessageID) {
+			b.log.Warn("ignored malformed structured Discord reaction", "channel", destination)
 			return
 		}
+		reaction := discordReaction{add: event == "react-add", emoji: emoji}
+		b.relayReactionWithRetry(destination, nick, reaction, text, notice, 50, target, discordMessageID)
+		return
+	case "react-remove-all", "react-remove-emoji":
+		// IRC has no native equivalent; preserve these explicit state changes as notices.
+		b.relayToErgo(destination, nick, text, true, discordMessageRef{})
+		return
+	}
+	// Legacy fallback supports rollback to an older rdircd image.
+	if isDiscordDeletion(text) && validDiscordID(discordMessageID) {
+		b.relayRedactionWithRetry(destination, 50, target, discordMessageID)
+		return
 	}
 	if reaction, ok := parseDiscordReaction(text); ok {
-		_, discordMessageID := msg.GetTag("+dickord/discord-msgid")
 		b.relayReactionWithRetry(destination, nick, reaction, text, notice, 50, target, discordMessageID)
 		return
 	}
-	_, discordMessageID := msg.GetTag("+dickord/discord-msgid")
 	b.relayToErgo(destination, nick, text, notice, discordMessageRef{source: target, messageID: discordMessageID})
+}
+
+func validDiscordID(value string) bool {
+	_, err := strconv.ParseUint(value, 10, 64)
+	return value != "" && err == nil
 }
 
 func (b *Bridge) relayReactionWithRetry(destination, nick string, reaction discordReaction, fallbackText string, notice bool, attempts int, source, discordMessageID string) {
@@ -668,23 +742,26 @@ func (b *Bridge) relayReactionWithRetry(destination, nick string, reaction disco
 			return
 		}
 		b.mu.RLock()
-		ergoMsgID = b.ergoByDiscord[discordRefKey{source: ircCasefold(source), messageID: discordMessageID}]
+		ids := b.ergoByDiscord[discordRefKey{source: ircCasefold(source), messageID: discordMessageID}]
+		if len(ids) > 0 {
+			ergoMsgID = ids[0]
+		}
 		b.mu.RUnlock()
-	} else if reaction.originalNick != "" && reaction.originalText != "" {
+	}
+	if ergoMsgID == "" && reaction.originalNick != "" && reaction.originalText != "" {
 		ergoMsgID = b.lookupMessageRef(destination, reaction.originalNick, reaction.originalText)
 		if ergoMsgID != "" && b.consumePendingReaction(ergoMsgID, reaction) {
 			return
 		}
 	}
 	if ergoMsgID != "" {
-		if b.sendNativeReaction(destination, nick, reaction, ergoMsgID, fallbackText, notice) {
-			return
+		if !b.sendNativeReaction(destination, reaction, ergoMsgID) {
+			b.log.Warn("native Discord reaction could not be sent", "channel", destination)
 		}
-		b.relayToErgo(destination, nick, fallbackText, notice, discordMessageRef{})
 		return
 	}
 	if attempts <= 0 {
-		b.relayToErgo(destination, nick, fallbackText, notice, discordMessageRef{})
+		b.log.Warn("Discord reaction target is not cached; text fallback suppressed", "channel", destination)
 		return
 	}
 	time.AfterFunc(100*time.Millisecond, func() {
@@ -776,19 +853,11 @@ func (b *Bridge) captureRelayEcho(conn *ircevent.Connection, msg ircmsg.Message)
 			b.messageRefOrder = append(b.messageRefOrder, key)
 		}
 		b.messageRefs[key] = msgID
-		if pending.discord.source != "" && pending.discord.messageID != "" {
-			b.discordRefs[msgID] = pending.discord
-			b.ergoByDiscord[discordRefKey{source: ircCasefold(pending.discord.source), messageID: pending.discord.messageID}] = msgID
-		}
+		b.cacheDiscordRefLocked(msgID, pending.discord)
 		if len(b.messageRefOrder) > 4096 {
 			oldest := b.messageRefOrder[0]
 			b.messageRefOrder = b.messageRefOrder[1:]
-			oldMsgID := b.messageRefs[oldest]
 			delete(b.messageRefs, oldest)
-			if oldRef := b.discordRefs[oldMsgID]; oldRef.messageID != "" {
-				delete(b.ergoByDiscord, discordRefKey{source: ircCasefold(oldRef.source), messageID: oldRef.messageID})
-			}
-			delete(b.discordRefs, oldMsgID)
 		}
 	}
 	b.mu.Unlock()
@@ -811,8 +880,15 @@ func (b *Bridge) lookupMessageRef(destination, nick, text string) string {
 	return ""
 }
 
+func reactionEmojiKey(emoji string) string {
+	if strings.HasPrefix(emoji, ":") && strings.HasSuffix(emoji, ":") {
+		return strings.ToLower(emoji)
+	}
+	return emoji
+}
+
 func (b *Bridge) markPendingReaction(ref discordMessageRef, emoji string, add bool) (pendingDiscordReaction, bool) {
-	key := pendingDiscordReaction{source: ircCasefold(ref.source), messageID: ref.messageID, emoji: emoji, add: add}
+	key := pendingDiscordReaction{source: ircCasefold(ref.source), messageID: ref.messageID, emoji: reactionEmojiKey(emoji), add: add}
 	b.mu.Lock()
 	if expires, exists := b.pendingReactions[key]; exists && time.Now().Before(expires) {
 		b.mu.Unlock()
@@ -847,7 +923,7 @@ func (b *Bridge) consumePendingReactionRef(ref discordMessageRef, reaction disco
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	key := pendingDiscordReaction{source: ircCasefold(ref.source), messageID: ref.messageID, emoji: reaction.emoji, add: reaction.add}
+	key := pendingDiscordReaction{source: ircCasefold(ref.source), messageID: ref.messageID, emoji: reactionEmojiKey(reaction.emoji), add: reaction.add}
 	expires, ok := b.pendingReactions[key]
 	if !ok || time.Now().After(expires) {
 		delete(b.pendingReactions, key)
@@ -940,11 +1016,13 @@ func (b *Bridge) relayRedactionWithRetry(destination string, attempts int, sourc
 		return
 	}
 	b.mu.RLock()
-	ergoMsgID := b.ergoByDiscord[discordRefKey{source: ircCasefold(source), messageID: discordMessageID}]
+	ergoMsgIDs := append([]string(nil), b.ergoByDiscord[discordRefKey{source: ircCasefold(source), messageID: discordMessageID}]...)
 	b.mu.RUnlock()
-	if ergoMsgID != "" {
-		if !b.sendNativeRedaction(destination, ergoMsgID) {
-			b.log.Warn("native redaction could not be sent", "channel", destination)
+	if len(ergoMsgIDs) > 0 {
+		for _, ergoMsgID := range ergoMsgIDs {
+			if !b.sendNativeRedaction(destination, ergoMsgID) {
+				b.log.Warn("native redaction could not be sent", "channel", destination, "msgid", ergoMsgID)
+			}
 		}
 		return
 	}
@@ -1010,7 +1088,7 @@ func parseDiscordReaction(text string) (discordReaction, bool) {
 	return reaction, true
 }
 
-func (b *Bridge) sendNativeReaction(destination, nick string, reaction discordReaction, msgID, fallbackText string, notice bool) bool {
+func (b *Bridge) sendNativeReaction(destination string, reaction discordReaction, msgID string) bool {
 	b.mu.RLock()
 	conn := b.ergo
 	ready := b.ergoRegistered && b.operReady && b.relayReady
@@ -1026,7 +1104,7 @@ func (b *Bridge) sendNativeReaction(destination, nick string, reaction discordRe
 	if _, labeled := conn.AcknowledgedCaps()["labeled-response"]; labeled {
 		err := conn.SendWithLabel(func(response *ircevent.Batch) {
 			if response != nil && batchHasError(response) {
-				b.relayToErgo(destination, nick, fallbackText, notice, discordMessageRef{})
+				b.log.Warn("Ergo rejected native Discord reaction", "channel", destination)
 			}
 		}, tags, "TAGMSG", destination)
 		return err == nil
@@ -1262,7 +1340,7 @@ func (b *Bridge) onErgoMessage(conn *ircevent.Connection, msg ircmsg.Message) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
-	text = translateRelayAddress(text)
+	text = b.translateRelayAddress(source, text)
 	_, ergoMsgID := msg.GetTag("msgid")
 	for index, line := range splitUTF8(text, 380) {
 		tags := make(map[string]string, 2)
@@ -1307,10 +1385,16 @@ func authorizedMessage(msg ircmsg.Message, owners map[string]struct{}) (account,
 	return account, "", true
 }
 
-func translateRelayAddress(text string) string {
+func (b *Bridge) translateRelayAddress(source, text string) string {
 	nick, rest, found := strings.Cut(text, "/discord:")
 	if !found || nick == "" || strings.ContainsAny(nick, " \t") {
 		return text
+	}
+	b.mu.RLock()
+	userID := b.discordUsers[discordUserKey{source: ircCasefold(source), nick: ircCasefold(nick)}]
+	b.mu.RUnlock()
+	if validDiscordID(userID) {
+		return "<@" + userID + "> " + strings.TrimLeft(rest, " \t")
 	}
 	return "@" + nick + " " + strings.TrimLeft(rest, " \t")
 }

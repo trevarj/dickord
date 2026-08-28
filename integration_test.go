@@ -32,8 +32,11 @@ import (
 const (
 	integrationOperHash          = "$2a$04$ZgyWYPnm.ETL4Aq/RBLba.b.qb/Ky31EI7eA.yqoX7ksY5gfv00SC" // "operpass", test-only
 	testDiscordMessageID         = "123456789012345678"
+	testDiscordUserID            = "222222222222222222"
 	testOutboundDiscordMessageID = "987654321098765432"
 	testSelfDiscordMessageID     = "111111111111111111"
+	testMultilineDiscordID       = "333333333333333333"
+	testCaughtUpDiscordID        = "555555555555555555"
 )
 
 type capturedReaction struct {
@@ -155,6 +158,13 @@ func TestErgoIntegration(t *testing.T) {
 		t.Fatalf("mapped reply=%+v", got)
 	}
 
+	if err := owner.Privmsg("#discord.me.chat.alice", "Alice/discord: hi"); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitOutbound(t, fake.outbound, "cached Discord mention"); got.text != "<@"+testDiscordUserID+"> hi" {
+		t.Fatalf("cached mention=%+v", got)
+	}
+
 	if err := owner.SendWithTags(map[string]string{"+reply": "unknown-ergo-msgid"}, "PRIVMSG", "#discord.me.chat.alice", "unknown reply target"); err != nil {
 		t.Fatal(err)
 	}
@@ -217,6 +227,37 @@ func TestErgoIntegration(t *testing.T) {
 		t.Fatal("Discord reaction-to-IRC translation timed out")
 	}
 
+	bridge.relayReactionWithRetry(
+		"#discord.me.chat.alice", "Bob", discordReaction{add: true, emoji: "❓"},
+		"--- reacts: +❓", false, 0, "#me.chat.alice", "444444444444444444",
+	)
+	select {
+	case msg := <-ownerMessages:
+		t.Fatalf("uncorrelated reaction leaked as text: %+v", msg)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	fake.SendUnsupportedReaction(testDiscordMessageID, "Bob", "react-remove-all", "-all")
+	select {
+	case msg := <-ownerMessages:
+		if len(msg.Params) < 2 || !strings.Contains(msg.Params[1], "reacts: -all") {
+			t.Fatalf("unsupported reaction notice=%+v", msg)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("unsupported reaction notice timed out")
+	}
+
+	fake.SendLegacyReaction(testDiscordMessageID, "Bob", "+✅", "Alice", "hello from Discord")
+	select {
+	case msg := <-ownerMessages:
+		_, reaction := msg.GetTag("+react")
+		if msg.Command != "TAGMSG" || reaction != "✅" {
+			t.Fatalf("legacy reaction was not translated natively: %+v", msg)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("legacy reaction translation timed out")
+	}
+
 	if err := owner.SendWithTags(map[string]string{"+reply": ircMessageID, "+draft/react": "🔥"}, "PRIVMSG", "#discord.me.chat.alice", "🔥"); err != nil {
 		t.Fatal(err)
 	}
@@ -273,6 +314,52 @@ func TestErgoIntegration(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Discord deletion-to-IRC REDACT timed out")
+	}
+
+	fake.SendDiscordID(testCaughtUpDiscordID, "[2026-08-27 00:00:00] caught up")
+	var caughtUpErgoID string
+	select {
+	case msg := <-ownerMessages:
+		_, caughtUpErgoID = msg.GetTag("msgid")
+	case <-time.After(3 * time.Second):
+		t.Fatal("caught-up Discord relay timed out")
+	}
+	fake.SendReaction(testCaughtUpDiscordID, "Bob", "+📌", "Alice", "caught up")
+	select {
+	case msg := <-ownerMessages:
+		_, reply := msg.GetTag("+reply")
+		if msg.Command != "TAGMSG" || reply != caughtUpErgoID {
+			t.Fatalf("caught-up reaction target=%q, want %q", reply, caughtUpErgoID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("caught-up reaction translation timed out")
+	}
+
+	fake.SendDiscordID(testMultilineDiscordID, "first line", "second line")
+	multilineIDs := make(map[string]bool)
+	for range 2 {
+		select {
+		case msg := <-ownerMessages:
+			_, id := msg.GetTag("msgid")
+			if id == "" {
+				t.Fatal("multiline relay has no Ergo msgid")
+			}
+			multilineIDs[id] = true
+		case <-time.After(3 * time.Second):
+			t.Fatal("multiline Discord relay timed out")
+		}
+	}
+	fake.SendDelete(testMultilineDiscordID)
+	for range 2 {
+		select {
+		case msg := <-ownerMessages:
+			if msg.Command != "REDACT" || len(msg.Params) < 2 || !multilineIDs[msg.Params[1]] {
+				t.Fatalf("unexpected multiline redaction: %+v", msg)
+			}
+			delete(multilineIDs, msg.Params[1])
+		case <-time.After(3 * time.Second):
+			t.Fatal("multiline Discord redaction timed out")
+		}
 	}
 
 	if err := owner.Privmsg("#discord.me.chat.alice", "hello from Ergo"); err != nil {
@@ -634,15 +721,30 @@ func (f *fakeRDirCD) Close() {
 }
 
 func (f *fakeRDirCD) SendDiscord(text string) {
-	f.send("@+dickord/discord-msgid=" + testDiscordMessageID + " :Alice!Alice@discord PRIVMSG #me.chat.alice :" + text)
+	f.SendDiscordID(testDiscordMessageID, text)
+}
+
+func (f *fakeRDirCD) SendDiscordID(messageID string, lines ...string) {
+	for _, text := range lines {
+		f.send("@+dickord/discord-msgid=" + messageID + ";+dickord/discord-userid=" + testDiscordUserID + " :Alice!Alice@discord PRIVMSG #me.chat.alice :" + text)
+	}
 }
 
 func (f *fakeRDirCD) SendSelfDiscord(nick, text string) {
-	f.send("@+dickord/discord-msgid=" + testSelfDiscordMessageID + ";+dickord/self=1 :" + nick + "!self@discord PRIVMSG #me.chat.alice :" + text)
+	f.send("@+dickord/discord-msgid=" + testSelfDiscordMessageID + ";+dickord/discord-userid=" + testDiscordUserID + ";+dickord/self=1 :" + nick + "!self@discord PRIVMSG #me.chat.alice :" + text)
 }
 
 func (f *fakeRDirCD) SendDelete(discordMessageID string) {
-	f.send("@+dickord/discord-msgid=" + discordMessageID + " :core!core@discord NOTICE #me.chat.alice :--- message was deleted [2026-08-27T00:00:00.000Z]")
+	f.send("@+dickord/discord-msgid=" + discordMessageID + ";+dickord/event=delete :core!core@discord NOTICE #me.chat.alice :--- message was deleted [2026-08-27T00:00:00.000Z]")
+}
+
+func (f *fakeRDirCD) SendUnsupportedReaction(discordMessageID, reactor, event, reaction string) {
+	f.send("@+dickord/discord-msgid=" + discordMessageID + ";+dickord/discord-userid=" + testDiscordUserID + ";+dickord/event=" + event + " :" + reactor + "!" + reactor + "@discord PRIVMSG #me.chat.alice :--- reacts: " + reaction)
+}
+
+func (f *fakeRDirCD) SendLegacyReaction(discordMessageID, reactor, reaction, originalNick, originalText string) {
+	text := "--- reacts: " + reaction + " :: [2026-08-27T00:00:00.000Z] <" + originalNick + "> " + originalText
+	f.send("@+dickord/discord-msgid=" + discordMessageID + " :" + reactor + "!" + reactor + "@discord PRIVMSG #me.chat.alice :" + text)
 }
 
 func (f *fakeRDirCD) SendReaction(discordMessageID, reactor, reaction, originalNick, originalText string) {
@@ -650,7 +752,12 @@ func (f *fakeRDirCD) SendReaction(discordMessageID, reactor, reaction, originalN
 	if originalNick != "" {
 		text = "--- reacts: " + reaction + " :: [2026-08-27T00:00:00.000Z] <" + originalNick + "> " + originalText
 	}
-	f.send("@+dickord/discord-msgid=" + discordMessageID + " :" + reactor + "!" + reactor + "@discord PRIVMSG #me.chat.alice :" + text)
+	event := "react-add"
+	if strings.HasPrefix(reaction, "-") {
+		event = "react-remove"
+	}
+	emoji := strings.TrimLeft(reaction, "+-")
+	f.send("@+dickord/discord-msgid=" + discordMessageID + ";+dickord/discord-userid=" + testDiscordUserID + ";+dickord/event=" + event + ";+dickord/emoji=" + emoji + ";+dickord/discord-emoji=" + emoji + " :" + reactor + "!" + reactor + "@discord PRIVMSG #me.chat.alice :" + text)
 }
 
 func (f *fakeRDirCD) acceptLoop() {

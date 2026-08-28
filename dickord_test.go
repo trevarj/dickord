@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -166,16 +167,59 @@ func TestReactionTags(t *testing.T) {
 }
 
 func TestRelayAddressTranslation(t *testing.T) {
-	tests := map[string]string{
-		"Crispy/discord: hi":       "@Crispy hi",
-		"Crispy/discord:hi":        "@Crispy hi",
-		"hello Crispy/discord: hi": "hello Crispy/discord: hi",
-		"Crispy: hi":               "Crispy: hi",
+	bridge := &Bridge{discordUsers: map[discordUserKey]string{
+		{source: "#one", nick: "crispy"}: "123456789012345678",
+	}}
+	tests := []struct {
+		source   string
+		input    string
+		expected string
+	}{
+		{"#one", "Crispy/discord: hi", "<@123456789012345678> hi"},
+		{"#two", "Crispy/discord: hi", "@Crispy hi"},
+		{"#one", "Crispy/discord:hi", "<@123456789012345678> hi"},
+		{"#one", "hello Crispy/discord: hi", "hello Crispy/discord: hi"},
+		{"#one", "Crispy: hi", "Crispy: hi"},
 	}
-	for input, expected := range tests {
-		if actual := translateRelayAddress(input); actual != expected {
-			t.Errorf("translateRelayAddress(%q)=%q, want %q", input, actual, expected)
+	for _, test := range tests {
+		if actual := bridge.translateRelayAddress(test.source, test.input); actual != test.expected {
+			t.Errorf("translateRelayAddress(%q)=%q, want %q", test.input, actual, test.expected)
 		}
+	}
+}
+
+func TestDiscordCorrelationGroupsAndEviction(t *testing.T) {
+	bridge := &Bridge{
+		cfg:           RuntimeConfig{Config: Config{Channels: ChannelConfig{CatchUpLimit: 300}}},
+		sourceToDest:  make(map[string]string),
+		discordRefs:   make(map[string]discordMessageRef),
+		ergoByDiscord: make(map[discordRefKey][]string),
+	}
+	for i := 0; i < 17; i++ {
+		bridge.sourceToDest["#source."+strconv.Itoa(i)] = "#dest"
+	}
+	if limit := bridge.discordRefLimitLocked(); limit != 5100 {
+		t.Fatalf("correlation limit=%d, want 5100", limit)
+	}
+	ref := discordMessageRef{source: "#source.0", messageID: "100"}
+	bridge.cacheDiscordRefLocked("ergo-first", ref)
+	bridge.cacheDiscordRefLocked("ergo-second", ref)
+	key := discordRefKey{source: "#source.0", messageID: "100"}
+	if got := bridge.ergoByDiscord[key]; len(got) != 2 || got[0] != "ergo-first" || got[1] != "ergo-second" {
+		t.Fatalf("correlation group=%v", got)
+	}
+
+	bridge.cfg.Channels.CatchUpLimit = 1
+	bridge.sourceToDest = map[string]string{"#only": "#dest"}
+	for i := 0; i < 4096; i++ {
+		id := strconv.Itoa(1000 + i)
+		bridge.cacheDiscordRefLocked("ergo-"+id, discordMessageRef{source: "#only", messageID: id})
+	}
+	if _, exists := bridge.ergoByDiscord[key]; exists {
+		t.Fatal("oldest correlation group was not evicted")
+	}
+	if _, exists := bridge.discordRefs["ergo-first"]; exists {
+		t.Fatal("eviction did not remove reverse correlation")
 	}
 }
 
