@@ -42,6 +42,11 @@ type capturedReaction struct {
 	add     bool
 }
 
+type capturedOutbound struct {
+	text string
+	tags map[string]string
+}
+
 func TestErgoIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
@@ -111,6 +116,23 @@ func TestErgoIntegration(t *testing.T) {
 	defer owner.Quit()
 	waitSignal(t, ownerJoined, "owner autojoin after connecting late")
 
+	for _, state := range []string{"active", "paused", "done"} {
+		if err := owner.SendWithTags(map[string]string{"+typing": state}, "TAGMSG", "#discord.me.chat.alice"); err != nil {
+			t.Fatal(err)
+		}
+		if got := waitText(t, fake.typing, "owner typing "+state); got != state {
+			t.Fatalf("typing state=%q, want %q", got, state)
+		}
+	}
+	if err := owner.SendWithTags(map[string]string{"+typing": "invalid"}, "TAGMSG", "#discord.me.chat.alice"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case state := <-fake.typing:
+		t.Fatalf("malformed typing passed: %q", state)
+	case <-time.After(200 * time.Millisecond):
+	}
+
 	fake.SendDiscord("hello from Discord")
 	var ircMessageID string
 	select {
@@ -124,6 +146,53 @@ func TestErgoIntegration(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Discord-to-Ergo relay timed out")
+	}
+
+	if err := owner.SendWithTags(map[string]string{"+reply": ircMessageID}, "PRIVMSG", "#discord.me.chat.alice", "native reply"); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitOutbound(t, fake.outbound, "mapped native reply"); got.text != "native reply" || got.tags["+dickord/discord-reply-msgid"] != testDiscordMessageID {
+		t.Fatalf("mapped reply=%+v", got)
+	}
+
+	if err := owner.SendWithTags(map[string]string{"+reply": "unknown-ergo-msgid"}, "PRIVMSG", "#discord.me.chat.alice", "unknown reply target"); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitOutbound(t, fake.outbound, "unknown reply fallback"); got.text != "unknown reply target" || got.tags["+dickord/discord-reply-msgid"] != "" {
+		t.Fatalf("unknown reply fallback=%+v", got)
+	}
+
+	const crossChannelErgoID = "cross-channel-ergo-msgid"
+	bridge.mu.Lock()
+	bridge.discordRefs[crossChannelErgoID] = discordMessageRef{source: "#other.channel", messageID: testDiscordMessageID}
+	bridge.mu.Unlock()
+	if err := owner.SendWithTags(map[string]string{"+reply": crossChannelErgoID}, "PRIVMSG", "#discord.me.chat.alice", "cross-channel reply target"); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitOutbound(t, fake.outbound, "cross-channel reply fallback"); got.text != "cross-channel reply target" || got.tags["+dickord/discord-reply-msgid"] != "" {
+		t.Fatalf("cross-channel reply fallback=%+v", got)
+	}
+
+	longReply := strings.Repeat("split reply text ", 23)
+	parts := splitUTF8(longReply, 380)
+	if len(parts) < 2 {
+		t.Fatal("split reply fixture did not split")
+	}
+	if err := owner.SendWithTags(map[string]string{"+reply": ircMessageID}, "PRIVMSG", "#discord.me.chat.alice", longReply); err != nil {
+		t.Fatal(err)
+	}
+	for index, want := range parts {
+		got := waitOutbound(t, fake.outbound, "split reply chunk")
+		if got.text != want {
+			t.Fatalf("split reply chunk %d text=%q, want %q", index, got.text, want)
+		}
+		wantReply := ""
+		if index == 0 {
+			wantReply = testDiscordMessageID
+		}
+		if got.tags["+dickord/discord-reply-msgid"] != wantReply {
+			t.Fatalf("split reply chunk %d reference=%q, want %q", index, got.tags["+dickord/discord-reply-msgid"], wantReply)
+		}
 	}
 
 	fake.SendSelfDiscord("DiscordDisplayName", "hello from official Discord")
@@ -161,7 +230,7 @@ func TestErgoIntegration(t *testing.T) {
 	}
 	select {
 	case got := <-fake.outbound:
-		t.Fatalf("reaction body leaked as Discord message: %q", got)
+		t.Fatalf("reaction body leaked as Discord message: %+v", got)
 	case <-time.After(200 * time.Millisecond):
 	}
 	fake.SendReaction(testDiscordMessageID, "owner", "+🔥", "Alice", "hello from Discord")
@@ -209,8 +278,8 @@ func TestErgoIntegration(t *testing.T) {
 	if err := owner.Privmsg("#discord.me.chat.alice", "hello from Ergo"); err != nil {
 		t.Fatal(err)
 	}
-	if got := waitText(t, fake.outbound, "Ergo-to-Discord relay"); got != "hello from Ergo" {
-		t.Fatalf("outbound=%q", got)
+	if got := waitOutbound(t, fake.outbound, "Ergo-to-Discord relay"); got.text != "hello from Ergo" {
+		t.Fatalf("outbound=%+v", got)
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	var outboundErgoID string
@@ -282,7 +351,23 @@ func TestErgoIntegration(t *testing.T) {
 	}
 	select {
 	case got := <-fake.outbound:
-		t.Fatalf("unauthorized message passed: %q", got)
+		t.Fatalf("unauthorized message passed: %+v", got)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err := mallory.SendWithTags(map[string]string{"+reply": ircMessageID}, "PRIVMSG", "#discord.me.chat.alice", "unauthorized reply"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-fake.outbound:
+		t.Fatalf("unauthorized reply passed: %+v", got)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err := mallory.SendWithTags(map[string]string{"+typing": "active"}, "TAGMSG", "#discord.me.chat.alice"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case state := <-fake.typing:
+		t.Fatalf("unauthorized typing passed: %q", state)
 	case <-time.After(500 * time.Millisecond):
 	}
 
@@ -505,7 +590,8 @@ type fakeRDirCD struct {
 	accepted     chan struct{}
 	joined       chan struct{}
 	disconnected chan struct{}
-	outbound     chan string
+	outbound     chan capturedOutbound
+	typing       chan string
 	topics       chan string
 	reactions    chan capturedReaction
 	redactions   chan string
@@ -524,7 +610,8 @@ func newFakeRDirCD(t *testing.T) *fakeRDirCD {
 		accepted:     make(chan struct{}, 8),
 		joined:       make(chan struct{}, 8),
 		disconnected: make(chan struct{}, 8),
-		outbound:     make(chan string, 16),
+		outbound:     make(chan capturedOutbound, 16),
+		typing:       make(chan string, 8),
 		topics:       make(chan string, 8),
 		reactions:    make(chan capturedReaction, 8),
 		redactions:   make(chan string, 8),
@@ -621,6 +708,10 @@ func (f *fakeRDirCD) handle(conn net.Conn) {
 				tags[key] = value
 			}
 			if strings.HasPrefix(strings.ToUpper(command), "TAGMSG #ME.CHAT.ALICE") {
+				if state := tags["+typing"]; state != "" {
+					f.typing <- state
+					continue
+				}
 				emoji, add := tags["+draft/react"], true
 				if emoji == "" {
 					emoji, add = tags["+draft/unreact"], false
@@ -664,7 +755,7 @@ func (f *fakeRDirCD) handle(conn net.Conn) {
 				f.redactions <- params[2]
 			}
 		case strings.HasPrefix(upper, "PRIVMSG #ME.CHAT.ALICE :"):
-			f.outbound <- line[strings.Index(line, " :")+2:]
+			f.outbound <- capturedOutbound{text: line[strings.Index(line, " :")+2:], tags: tags}
 			if ergoMsgID := tags["+dickord/ergo-msgid"]; ergoMsgID != "" {
 				f.sendTo(conn, "@+dickord/discord-msgid="+testOutboundDiscordMessageID+";+reply="+ergoMsgID+" :fake TAGMSG #me.chat.alice")
 			}
@@ -771,6 +862,17 @@ func waitText(t *testing.T, values <-chan string, description string) string {
 	case <-time.After(8 * time.Second):
 		t.Fatal("timed out waiting for " + description)
 		return ""
+	}
+}
+
+func waitOutbound(t *testing.T, values <-chan capturedOutbound, description string) capturedOutbound {
+	t.Helper()
+	select {
+	case value := <-values:
+		return value
+	case <-time.After(8 * time.Second):
+		t.Fatal("timed out waiting for " + description)
+		return capturedOutbound{}
 	}
 }
 

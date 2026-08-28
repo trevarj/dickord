@@ -20,6 +20,7 @@ handles Discord's user-client protocol.
 - Self-authored Discord messages attributed to the configured owner
 - Owner-only IRC-to-Discord messages and actions
 - Native IRCv3 reactions and message redactions in both directions
+- Native Motd-to-Discord replies and optional typing notifications
 
 ## Requirements
 
@@ -62,6 +63,10 @@ to the host.
    A guild thread is normally matched by adding `.=*` after its parent channel
    pattern. The default `me.*` pattern includes Discord DMs.
 
+   To forward Motd typing notifications to Discord, set
+   `typing-send-enabled = yes` under `[irc]` in `config/rdircd.ini`. This is
+   deliberately off by default because typing status is presence information.
+
 4. For an Ergo server using a private CA, install its public certificate and
    enable the optional mount:
 
@@ -92,10 +97,16 @@ Discord authors appear through Ergo `RELAYMSG` identities ending in `/discord`.
 Messages authored by the Discord account itself use the first configured owner
 name with the same suffix. This avoids collisions with real Ergo users.
 
+Motd replies to recently correlated Discord messages become native Discord
+replies. Correlation is kept in a bounded 4,096-message in-memory cache; after a
+restart or cache eviction, the same action safely sends a normal message instead.
+Long messages are split as before, with only the first Discord chunk attached
+to the reply.
+
 ## Security model
 
-Dickord authorizes outbound messages, reactions, and redactions from the IRCv3
-`account` tag, not from nicknames. Only accounts listed in
+Dickord authorizes outbound messages, typing, reactions, and redactions from the
+IRCv3 `account` tag, not from nicknames. Only accounts listed in
 `ergo.owner_accounts` are accepted. Missing account tags, OPER authorization,
 required capabilities, message IDs, or channel mappings fail closed.
 

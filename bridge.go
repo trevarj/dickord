@@ -1125,7 +1125,33 @@ func (b *Bridge) forwardErgoReactionWithRetry(conn *ircevent.Connection, destina
 }
 
 func (b *Bridge) onErgoTagMessage(conn *ircevent.Connection, msg ircmsg.Message) {
-	b.onErgoReaction(conn, msg)
+	if b.onErgoReaction(conn, msg) {
+		return
+	}
+	present, state := msg.GetTag("+typing")
+	if !present || len(msg.Params) != 1 || isPlayback(msg) {
+		return
+	}
+	switch state {
+	case "active", "paused", "done":
+	default:
+		return
+	}
+	if _, _, authorized := authorizedMessage(msg, b.cfg.OwnerAccountsSet); !authorized {
+		return
+	}
+
+	destination := msg.Params[0]
+	b.mu.RLock()
+	source := b.destToSource[ircCasefold(destination)]
+	rdircd := b.rdircd
+	ready := b.rdircdReady && rdircd != nil && b.ergo == conn && b.ergoRegistered && b.operReady
+	b.mu.RUnlock()
+	if !ready || source == "" {
+		return
+	}
+	// rdircd owns the privacy opt-in and interprets paused/done as stop states.
+	_ = rdircd.SendWithTags(map[string]string{"+typing": state}, "TAGMSG", source)
 }
 
 func (b *Bridge) onErgoRedact(conn *ircevent.Connection, msg ircmsg.Message) {
@@ -1199,11 +1225,17 @@ func (b *Bridge) onErgoMessage(conn *ircevent.Connection, msg ircmsg.Message) {
 	}
 
 	destination, text := msg.Params[0], ircfmt.Strip(msg.Params[1])
+	_, replyID := msg.GetTag("+reply")
 	b.mu.RLock()
 	source := b.destToSource[ircCasefold(destination)]
 	rdircd := b.rdircd
 	ready := b.rdircdReady && rdircd != nil && b.ergo == conn && b.ergoRegistered && b.operReady
+	replyRef := b.discordRefs[replyID]
 	b.mu.RUnlock()
+	discordReplyID := ""
+	if replyRef.messageID != "" && ircCasefold(replyRef.source) == ircCasefold(source) {
+		discordReplyID = replyRef.messageID
+	}
 	if source == "" {
 		return
 	}
@@ -1231,10 +1263,14 @@ func (b *Bridge) onErgoMessage(conn *ircevent.Connection, msg ircmsg.Message) {
 		return
 	}
 	_, ergoMsgID := msg.GetTag("msgid")
-	for _, line := range splitUTF8(text, 380) {
-		tags := map[string]string(nil)
+	for index, line := range splitUTF8(text, 380) {
+		tags := make(map[string]string, 2)
 		if ergoMsgID != "" {
-			tags = map[string]string{"+dickord/ergo-msgid": ergoMsgID}
+			tags["+dickord/ergo-msgid"] = ergoMsgID
+		}
+		// One logical reply can split into many Discord posts; only the first keeps the relation.
+		if index == 0 && discordReplyID != "" {
+			tags["+dickord/discord-reply-msgid"] = discordReplyID
 		}
 		if err := rdircd.SendWithTags(tags, "PRIVMSG", source, line); err != nil {
 			b.notifyErgo(destination, "Discord bridge unavailable; message not sent")
