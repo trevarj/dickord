@@ -112,6 +112,66 @@ class PayloadTests(unittest.TestCase):
         with self.assertRaises(rdircd.IRCBridgeSignal):
             rdircd.Discord.reaction_api_emoji(channel, ":missing:")
 
+    def test_reaction_events_preserve_custom_identity_and_burst(self):
+        session = rdircd.DiscordSession.__new__(rdircd.DiscordSession)
+        session.conf = rdircd.adict(
+            irc_disable_reacts_msgs=False,
+            _discord_msg_old_prefix={},
+            _discord_msg_old_ignore={},
+        )
+        session.log = Log()
+        channel = rdircd.adict(
+            id="20",
+            users_static={},
+        )
+        guild = rdircd.adict(
+            id="10",
+            chans={"20": channel},
+            emojis={"party": rdircd.adict(name="Party", id="123")},
+        )
+        channel.gg = guild
+        received = []
+        session.st_da = rdircd.adict(
+            user=rdircd.adict(id="7"),
+            guilds={"10": guild},
+        )
+        session.discord = rdircd.adict(
+            flake_parse=lambda _value: 1.0,
+            cmd_user_cache=lambda *_args, **_kwargs: None,
+            user_name=lambda _user: "owner",
+            cmd_msg_recv=lambda *_args, **kwargs: received.append(kwargs),
+        )
+        session.op_msg_ref_get = lambda *_args: None
+
+        session.op_react(
+            rdircd.adict(
+                guild_id="10",
+                channel_id="20",
+                message_id="30",
+                user_id="7",
+                member=rdircd.adict(user=rdircd.adict(id="7")),
+                emoji=rdircd.adict(id="123", name="Party"),
+                burst=True,
+            ),
+            "add",
+        )
+        self.assertEqual(received[-1]["discord_event"], "react-add")
+        self.assertEqual(received[-1]["discord_emoji"], ":Party:")
+        self.assertEqual(received[-1]["discord_emoji_api"], "Party:123")
+        self.assertTrue(received[-1]["discord_burst"])
+
+        session.op_react(
+            rdircd.adict(
+                guild_id="10",
+                channel_id="20",
+                message_id="30",
+                emoji=rdircd.adict(id="123", name=None),
+            ),
+            "remove_emoji",
+        )
+        self.assertEqual(received[-1]["discord_event"], "react-remove-emoji")
+        self.assertEqual(received[-1]["discord_emoji_api"], "Party:123")
+
     def test_structured_tags_escape_and_validate(self):
         protocol = rdircd.IRCProtocol.__new__(rdircd.IRCProtocol)
         protocol.log = Log()
