@@ -1,4 +1,6 @@
 /result
+__pycache__/
+*.pyc
 /dickord
 /.direnv
 /.env
