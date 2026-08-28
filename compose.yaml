@@ -1,0 +1,110 @@
+name: dickord
+
+x-rdircd-build: &rdircd-build
+  context: .
+  dockerfile: Dockerfile.rdircd
+  args:
+    RDIRCD_REF: "bcb5438afd1ee38191045284c157c0124cf3d655"
+    UID: "${CONTAINER_UID:-1000}"
+    GID: "${CONTAINER_GID:-1000}"
+
+x-after-rdircd: &after-rdircd
+  depends_on:
+    rdircd-init:
+      condition: service_completed_successfully
+
+services:
+  rdircd-init:
+    build: *rdircd-build
+    user: "0:0"
+    network_mode: none
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        chown ${CONTAINER_UID:-1000}:${CONTAINER_GID:-1000} /config
+        chmod 0700 /config
+        for file in config.ini state.ini; do
+          if [ ! -e "/config/$$file" ]; then
+            install -o ${CONTAINER_UID:-1000} -g ${CONTAINER_GID:-1000} -m 0600 /dev/null "/config/$$file"
+          fi
+        done
+    volumes:
+      - rdircd-state:/config
+    restart: "no"
+
+  rdircd:
+    <<: *after-rdircd
+    build: *rdircd-build
+    command:
+      - -c
+      - /run/config/rdircd.ini
+      - -c
+      - /run/secrets/discord.ini
+      - -c
+      - /config/state.ini
+    configs:
+      - source: rdircd
+        target: /run/config/rdircd.ini
+        mode: 0444
+    secrets:
+      - source: discord
+        target: discord.ini
+        mode: 0400
+    volumes:
+      - rdircd-state:/config
+    networks: [backend, egress]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  dickord:
+    build: .
+    user: "${CONTAINER_UID:-1000}:${CONTAINER_GID:-1000}"
+    depends_on:
+      rdircd:
+        condition: service_started
+    configs:
+      - source: dickord
+        target: /run/config/dickord.json
+        mode: 0444
+    secrets:
+      - source: ergo-sasl
+        target: ergo-sasl
+        mode: 0400
+      - source: ergo-oper
+        target: ergo-oper
+        mode: 0400
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    networks: [backend, egress]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+configs:
+  dickord:
+    file: "${DICKORD_CONFIG_FILE:-./config/dickord.example.json}"
+  rdircd:
+    file: "${RDIRCD_CONFIG_FILE:-./config/rdircd.example.ini}"
+
+secrets:
+  discord:
+    file: "${DISCORD_SECRET_FILE:-./secrets/discord.example.ini}"
+  ergo-sasl:
+    file: "${ERGO_SASL_SECRET_FILE:-./secrets/ergo-sasl.example}"
+  ergo-oper:
+    file: "${ERGO_OPER_SECRET_FILE:-./secrets/ergo-oper.example}"
+
+volumes:
+  rdircd-state:
+
+networks:
+  backend:
+    internal: true
+  egress:

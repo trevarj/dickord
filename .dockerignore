@@ -1,0 +1,9 @@
+.git
+.direnv
+.env
+compose.override.yaml
+result
+secrets
+config/dickord.json
+config/ergo-ca.pem
+config/rdircd.ini

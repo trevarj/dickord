@@ -1,0 +1,33 @@
+{
+  "ergo": {
+    "address": "host.docker.internal:6697",
+    "tls_server_name": "irc.example.com",
+    "nick": "Dickord",
+    "account": "Dickord",
+    "password_file": "/run/secrets/ergo-sasl",
+    "oper_name": "Dickord",
+    "oper_password_file": "/run/secrets/ergo-oper",
+    "ca_file": "",
+    "owner_accounts": ["owner"]
+  },
+  "rdircd": {
+    "address": "rdircd:6667",
+    "nick": "dickord"
+  },
+  "channels": {
+    "prefix": "discord.",
+    "dm_include_pattern": "me.*",
+    "channel_aliases": {},
+    "guild_include_globs": [
+      "example-guild.general",
+      "example-guild.general.=*"
+    ],
+    "catch_up": true,
+    "catch_up_limit": 300,
+    "max_name_length": 64
+  },
+  "reconnect": {
+    "minimum": "2s",
+    "maximum": "1m"
+  }
+}

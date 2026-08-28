@@ -1,0 +1,239 @@
+diff --git i/rdircd w/rdircd
+index bbd2ef8..251721f 100755
+--- i/rdircd
++++ w/rdircd
+@@ -1892,8 +1892,11 @@ class IRCProtocol(asyncio.Protocol):
+ 		self.send(351, self.bridge.server_ver, 'rdircd', ':rdircd discord-to-irc bridge')
+ 		self.send_feats()
+ 
+-	def recv_cmd_privmsg(self, target, text):
+-		self.cmd_msg_from_irc(target, text, from_self=True)
++	def recv_cmd_privmsg(self, m: adict):
++		if len(m.params) != 2: return self.send(461, ':Incorrect command parameters')
++		target, text = m.params
++		self.cmd_msg_from_irc( target, text, from_self=True,
++			ergo_msg_id=m.tags.get('+dickord/ergo-msgid') )
+ 
+ 	def recv_cmd_notice(self, target, text):
+ 		self.cmd_msg_from_irc(target, text, notice=True, from_self=True)
+@@ -1910,7 +1913,7 @@ class IRCProtocol(asyncio.Protocol):
+ 			self.send(403, chan, ':No such channel')
+ 			# Doesn't actually removes channels, as they get rename-notification there
+ 
+-	def cmd_msg_from_irc(self, target, text, notice=False, from_self=False):
++	def cmd_msg_from_irc(self, target, text, notice=False, from_self=False, ergo_msg_id=None):
+ 		'''Handler for messages posted from IRC.
+ 			With notice=True message is only handled in irc, without proxying it to discord.'''
+ 		msg_type = 'PRIVMSG' if not notice else 'NOTICE'
+@@ -1928,7 +1931,7 @@ class IRCProtocol(asyncio.Protocol):
+ 				if from_self and conn is self: continue
+ 				if name not in conn.st_irc.chans: self.cmd_join(chan) # from chan_auto_join_re
+ 				conn.send(f':{self.src_self()} {msg_type} {chan} :{text}')
+-			if not notice: self.bridge.irc_msg(self, chan, text)
++			if not notice: self.bridge.irc_msg(self, chan, text, ergo_msg_id=ergo_msg_id)
+ 		else:
+ 			if not (conn := self.bridge.cmd_conn(target)):
+ 				if not notice: self.send(401, target, ':No such nick/channel')
+@@ -1943,7 +1946,8 @@ class IRCProtocol(asyncio.Protocol):
+ 		'Same as cmd_msg_chan, but an error/notice from irc_nick_sys'
+ 		self.cmd_msg_chan(self.conf._irc_nick_sys, chan, text, notice=notice)
+ 
+-	def cmd_msg_chan(self, nick, chan, text, notice=False, joined=False):
++	def cmd_msg_chan( self, nick, chan, text, notice=False, joined=False,
++			discord_msg_id=None, discord_self=False ):
+ 		'''Send message to channel that this IRC client is connected to.
+ 			Message is never filtered/dropped here for reliability/sanity reasons.'''
+ 		msg_type = 'PRIVMSG' if not notice else 'NOTICE'
+@@ -1954,7 +1958,11 @@ class IRCProtocol(asyncio.Protocol):
+ 		if ( self.conf.irc_names_join and joined
+ 				and not notice and not irc_name_eq(nick, self.st_irc.nick) ):
+ 			self.send(f':{self.src_discord(nick)} JOIN {chan}')
+-		self.send(f':{self.src_discord(nick)} {msg_type} {chan} :{text}')
++		tags = list()
++		if discord_msg_id: tags.append(f'+dickord/discord-msgid={discord_msg_id}')
++		if discord_self: tags.append('+dickord/self=1')
++		tags = '' if not tags else f'@{";".join(tags)} '
++		self.send(f'{tags}:{self.src_discord(nick)} {msg_type} {chan} :{text}')
+ 		self.st_irc.typing_repeat.active.pop((nick, chan), None)
+ 
+ 	def cmd_typing(self, nick, chan, repeated=False):
+@@ -1989,7 +1997,21 @@ class IRCProtocol(asyncio.Protocol):
+ 			with cl.suppress(asyncio.TimeoutError):
+ 				await asyncio.wait_for(st.wakeup.wait(), delay - td_next)
+ 
++	def recv_cmd_redact(self, m: adict):
++		if len(m.params) < 2: return self.send(461, ':Incorrect command parameters')
++		chan, msg_id = m.params[:2]
++		if msg_id.isdigit() and self.chan_spec_check(chan) and self.req_chan_info(chan, check=False):
++			self.bridge.irc_delete(self, chan, msg_id)
++
+ 	def recv_cmd_tagmsg(self, m: adict): # should probably be a dispatcher
++		react = m.tags.get('+draft/react') or m.tags.get('+react')
++		unreact = m.tags.get('+draft/unreact') or m.tags.get('+unreact')
++		reply = m.tags.get('+reply')
++		if len(m.params) == 1 and reply and reply.isdigit() and bool(react) != bool(unreact):
++			chan = m.params[0]
++			if self.chan_spec_check(chan) and self.req_chan_info(chan, check=False):
++				self.bridge.irc_react(self, chan, reply, react or unreact, remove=bool(unreact))
++
+ 		if self.conf.irc_typing_send_enabled and (tag := m.tags.get('+typing')):
+ 			typing_stop, chans = False, list(m.params)
+ 			if tag in ['paused', 'done']: typing_stop = True
+@@ -2302,14 +2324,17 @@ class Discord:
+ 			m='patch', json=dict(content=line_tagged) )
+ 		if cc.last_msg_sent.get('flake') == flake: cc.last_msg_sent.line = line
+ 
++	@_cmd_msg_err_wrap
++	async def cmd_msg_delete(self, cc, msg_id):
++		await self.conn_req(f'channels/{cc.id}/messages/{msg_id}', m='delete', raw=True)
++
+ 	@_cmd_msg_err_wrap
+ 	async def cmd_msg_del_last(self, cc):
+ 		if not cc.last_msg_sent: raise IRCBridgeSignal('no-last-msg')
+ 		flake, line_old = cc.last_msg_sent.flake, cc.last_msg_sent.line
+ 		self.log.debug(
+ 			'MSG:  D> :: {} {} {} :: {}', cc.gg.id, cc.name, flake, self._repr(line_old) )
+-		await self.conn_req(
+-			f'channels/{cc.id}/messages/{flake}', m='delete', raw=True )
++		await self.cmd_msg_delete(cc, flake)
+ 		if cc.last_msg_sent.get('flake') == flake: cc.last_msg_sent.clear()
+ 
+ 	@_cmd_msg_err_wrap
+@@ -2352,6 +2377,7 @@ class Discord:
+ 		self.log.debug('Sending of msg {} confirmed: {}', flake_res, self._repr(line))
+ 		cc.last_msg_sent.update(flake=flake_res, line=line)
+ 		self.conf.state_watch(cc.id, ts, self.bridge.uid_start)
++		return flake_res
+ 
+ 	def cmd_msg_parse_flags(self, line, flags=0):
+ 		if m := self.conf._discord_msg_flag_silent_re.search(line):
+@@ -2518,6 +2544,13 @@ class Discord:
+ 		self.conn_req_oneway( f'channels/{cc.id}/typing', m='post',
+ 			raw=True, err_tpl='Sending IRC-typing notification failed: {err}' )
+ 
++	@_cmd_msg_err_wrap
++	async def cmd_react(self, cc, msg_id, emoji, remove=False):
++		'Add or remove current-user reaction on a Discord message.'
++		emoji = up.quote(emoji, safe='')
++		await self.conn_req( f'channels/{cc.id}/messages/{msg_id}/reactions/{emoji}/@me',
++			m='delete' if remove else 'put', raw=True )
++
+ 	def cmd_status(self, st_name):
+ 		if not (pb := getattr(self.c_status_protobuf, st_name, None)):
+ 			return self.log.error('Unknown/unsupported discord status: {}', st_name)
+@@ -3648,6 +3681,8 @@ class DiscordSession:
+ 		# Recursive call is a bit of a hack - much easier to tweak
+ 		#  prefixes and call cmd_msg_recv multiple times for different channels.
+ 		nick, ts = m.get('author'), time.time()
++		msg_from_self = bool( nick and self.st_da.get('user')
++			and nick.get('id') == self.st_da.user.get('id') )
+ 		msg_ev, msg_ts = None, self.discord.flake_parse(m.id)
+ 		old_pre, old_skip = self.conf._discord_msg_old_prefix, self.conf._discord_msg_old_ignore
+ 		if msg_is_update := act == 'update':
+@@ -3675,7 +3710,7 @@ class DiscordSession:
+ 			if (td := old_pre.get('delete')) and ts - msg_ts > td: pre = '[old-msg] '
+ 			if ref := self.op_msg_ref_get(m.id, cc): ext = f':: {ext} <{ref.nick}> {ref.line}'
+ 			return self.discord.cmd_msg_recv( cc, None,
+-				f'{pre}message was deleted {ext}', dict(_ev=True) )
++				f'{pre}message was deleted {ext}', dict(_ev=True), discord_msg_id=m.id )
+ 		if not m.get('content') and m.get('call'):
+ 			msg_ev, m.content = 'vc', 'voice-chat: incoming audio/video call notification'
+ 
+@@ -3748,7 +3783,8 @@ class DiscordSession:
+ 			tid_prefix and not self.conf.discord_thread_msgs_in_parent_chan_monitor )
+ 		self.discord.cmd_msg_recv( cc, nick, line.strip(), tags,
+ 			new_msg_flake=not msg_is_update and m.id, msg_id=m.id,
+-			nonce=m.get('nonce'), skip_monitor=skip_mirrored_msg_in_monitor )
++			nonce=m.get('nonce'), skip_monitor=skip_mirrored_msg_in_monitor,
++			discord_self=msg_from_self )
+ 
+ 	def op_msg_media_info(self, m, force_meta=False):
+ 		'Parse and return "embeds" objects as text lines to prefix and append to msg'
+@@ -4186,7 +4222,8 @@ class DiscordSession:
+ 			return self.log.debug('Ignoring too-old react-event {}: msg_id={}', ext, msg_id)
+ 		if td_pre and ts - msg_ts > td_pre: pre = '[old-msg] '
+ 		if ref := self.op_msg_ref_get(msg_id, cc): ext = f':: {ext} <{ref.nick}> {ref.line}'
+-		self.discord.cmd_msg_recv(cc, nick, f'{pre}reacts: {act}{emo} {ext}', dict(_ev=True))
++		self.discord.cmd_msg_recv( cc, nick, f'{pre}reacts: {act}{emo} {ext}',
++			dict(_ev=True), discord_msg_id=msg_id )
+ 
+ 	def op_gift_code(self, m):
+ 		if not ( (gg := self.st_da.guilds.get(m.get('guild_id', 1)))
+@@ -4606,7 +4643,7 @@ class RDIRCD:
+ 		conn.cmd_msg_self(info)
+ 		conn.cmd_msg_self(f'--- [{id_str}] end')
+ 
+-	def irc_msg(self, conn, chan, line):
++	def irc_msg(self, conn, chan, line, ergo_msg_id=None):
+ 		'Called with a new msg, posted by IRC user in any channel'
+ 		name = conn.chan_name(chan)
+ 		if sys_type := self.irc_chans_sys.get(name):
+@@ -4615,7 +4652,35 @@ class RDIRCD:
+ 		if not self.irc_msg_queue:
+ 			conn.cmd_msg_chan_sys(chan, f'Discarded {{irc-msg-queue-failed}}: {line}')
+ 		else: self.irc_msg_queue.put_nowait(
+-			adict(conn=conn, chan=chan, name=name, line=line) )
++			adict(conn=conn, chan=chan, name=name, line=line, ergo_msg_id=ergo_msg_id) )
++
++	def irc_delete(self, conn, chan, msg_id):
++		'Called for an IRCv3 redaction targeting a relayed Discord message.'
++		name = conn.chan_name(chan)
++		if not self.discord.st_eris.online:
++			return conn.cmd_msg_chan_sys(chan, 'delete-send-error: discord is offline')
++		if not (info := self.irc_discord_info(name)):
++			return conn.cmd_msg_chan_sys(chan, 'delete-send-error: no Discord channel')
++
++		async def send_delete():
++			try: await self.discord.cmd_msg_delete(info.cc, msg_id)
++			except IRCBridgeSignal as err:
++				conn.cmd_msg_chan_sys(chan, f'delete-send-error: {err}')
++		self.cmd_delay(send_delete())
++
++	def irc_react(self, conn, chan, msg_id, emoji, remove=False):
++		'Called for an IRCv3 reaction targeting a relayed Discord message.'
++		name = conn.chan_name(chan)
++		if not self.discord.st_eris.online:
++			return conn.cmd_msg_chan_sys(chan, 'reaction-send-error: discord is offline')
++		if not (info := self.irc_discord_info(name)):
++			return conn.cmd_msg_chan_sys(chan, 'reaction-send-error: no Discord channel')
++
++		async def send_react():
++			try: await self.discord.cmd_react(info.cc, msg_id, emoji, remove=remove)
++			except IRCBridgeSignal as err:
++				conn.cmd_msg_chan_sys(chan, f'reaction-send-error: {err}')
++		self.cmd_delay(send_react())
+ 
+ 	def irc_msg_translate_preq(self, line):
+ 		'IRC message processing right after receiving it and before anything else'
+@@ -4657,7 +4722,10 @@ class RDIRCD:
+ 						await self.discord.cmd_msg_del_last(info.cc)
+ 					else:
+ 						line = self.irc_msg_translate_postq(info, m.line)
+-						await self.discord.cmd_msg_send(info.cc, line)
++						discord_msg_id = await self.discord.cmd_msg_send(info.cc, line)
++						if m.ergo_msg_id:
++							m.conn.send( f'@+dickord/discord-msgid={discord_msg_id};'
++								f'+reply={m.ergo_msg_id} TAGMSG {m.chan}' )
+ 
+ 				except IRCBridgeSignal as err:
+ 					m.conn.cmd_msg_chan_sys( m.chan,
+@@ -5342,7 +5410,8 @@ class RDIRCD:
+ 		return msg_cut
+ 
+ 	def cmd_msg_discord( self, cc, nick=None, line=None, name_irc=None,
+-			tags=None, ts=None, conn=None, notice=None, skip_monitor=False, msg_id=None ) -> bool:
++			tags=None, ts=None, conn=None, notice=None, skip_monitor=False,
++			msg_id=None, discord_msg_id=None, discord_self=False ) -> bool:
+ 		'''Sends annotated Discord message to all proxy/monitor IRC channels.
+ 			conn= limits sending to proxy-chan of one irc conn, e.g. for history-replay.
+ 			name_irc= is used to set destination irc proxy-channel to use instead of cc.
+@@ -5390,7 +5459,8 @@ class RDIRCD:
+ 			joined = not cc.users.check_bump(nick_discord)
+ 			cc.users[nick_discord] = nick
+ 			for conn, (n, ln) in it.product(conns_joined, enumerate(chan_lines)):
+-				conn.cmd_msg_chan(nick, name, ln, notice=notice, joined=joined and not n)
++				conn.cmd_msg_chan( nick, name, ln, notice=notice, joined=joined and not n,
++					discord_msg_id=discord_msg_id or msg_id, discord_self=discord_self )
+ 
+ 		# Relay message to all relevant monitor/leftover channels
+ 		if skip_monitor: return

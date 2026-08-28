@@ -1,0 +1,4 @@
+services:
+  dickord:
+    volumes:
+      - ./config/ergo-ca.pem:/run/config/ergo-ca.pem:ro

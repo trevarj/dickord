@@ -1,0 +1,11 @@
+/result
+/dickord
+/.direnv
+/.env
+/compose.override.yaml
+/config/dickord.json
+/config/ergo-ca.pem
+/config/rdircd.ini
+/secrets/*
+!/secrets/*.example
+!/secrets/*.example.ini

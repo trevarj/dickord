@@ -1,0 +1,20 @@
+FROM alpine:3.23 AS source
+RUN apk add --no-cache git
+ARG RDIRCD_REF=bcb5438afd1ee38191045284c157c0124cf3d655
+RUN git clone --filter=blob:none https://github.com/mk-fg/reliable-discord-client-irc-daemon.git /src && \
+    git -C /src checkout --detach "$RDIRCD_REF"
+COPY rdircd-ircv3-reactions.patch /tmp/reactions.patch
+RUN git -C /src apply --check /tmp/reactions.patch && git -C /src apply /tmp/reactions.patch
+
+FROM alpine:3.23
+RUN apk add --no-cache python3 py3-aiohttp openssl
+ARG UID=1000
+ARG GID=1000
+RUN addgroup -S -g "$GID" rdircd && adduser -S -h /config -s /bin/false -G rdircd -DH -u "$UID" rdircd
+COPY --from=source /src/rdircd /src/rdircd.unicode-emojis.txt.gz /
+USER rdircd:rdircd
+ENV PYTHONUNBUFFERED=1
+EXPOSE 6667
+VOLUME /config
+WORKDIR /config
+ENTRYPOINT ["/rdircd", "--conf", "config.ini", "-i", "0.0.0.0"]
