@@ -1,10 +1,10 @@
 # Dickord
 
 Dickord bridges selected channels from a personal Discord account into an
-[Ergo](https://ergo.chat/) IRC server. It combines a small Go sidecar with a
-pinned, patched build of
-[`rdircd`](https://github.com/mk-fg/reliable-discord-client-irc-daemon), which
-handles Discord's user-client protocol.
+[Ergo](https://ergo.chat/) IRC server. It combines a small Go sidecar with the
+vendored [`rdircd`](https://github.com/mk-fg/reliable-discord-client-irc-daemon)
+fork under `rdircd/`, which handles Discord's user-client protocol. `rdircd/UPSTREAM`
+records the pinned upstream commit.
 
 > [!WARNING]
 > Automating a personal Discord account can violate Discord's terms of service

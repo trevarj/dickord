@@ -4,7 +4,6 @@ x-rdircd-build: &rdircd-build
   context: .
   dockerfile: Dockerfile.rdircd
   args:
-    RDIRCD_REF: "bcb5438afd1ee38191045284c157c0124cf3d655"
     UID: "${CONTAINER_UID:-1000}"
     GID: "${CONTAINER_GID:-1000}"
 
