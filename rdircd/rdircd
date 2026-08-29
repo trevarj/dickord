@@ -2393,6 +2393,10 @@ class Discord:
 		await self.cmd_msg_delete(cc, flake)
 		if cc.last_msg_sent.get('flake') == flake: cc.last_msg_sent.clear()
 
+	def msg_confirm_expire(self, nonce, fut):
+		if self.st_eris.msg_confirms.get(nonce) is fut:
+			self.st_eris.msg_confirms.pop(nonce, None)
+
 	@_cmd_msg_err_wrap
 	async def cmd_msg_send(self, cc, line, reply_msg_id=None):
 		'Relay message from IRC to Discord.'
@@ -2406,31 +2410,41 @@ class Discord:
 
 		nonce = self.flake_build(ts := time.time())
 		self.log.debug('MSG:  >> :: {} {} {} :: {}', cc.gg.id, cc.name, nonce, line)
+		fut, res, stage = None, None, 'prepare'
 		try:
-			res = None
 			async with aio_timeout(self.conf.discord_msg_confirm_timeout):
 				line, flags = self.cmd_msg_parse_flags(line)
 				line_tagged = self.cmd_msg_emojify(cc.gg, line)
 				line_tagged = await self.cmd_msg_mentionify(cc.gg.id, line_tagged)
 				payload = self.message_payload(
 					line_tagged, nonce, flags=flags, reply_msg_id=reply_msg_id )
-				res = asyncio.create_task(self.conn_req(
-					f'channels/{cc.id}/messages', m='post', json=payload ))
 				fut = self.st_eris.msg_confirms[nonce] = asyncio.Future()
-				res = asyncio.gather(fut, res)
-				flake_gw, res = await res
+				stage = 'post'
+				res = await self.conn_req(
+					f'channels/{cc.id}/messages', m='post', json=payload )
 		except DiscordHTTPError as err:
+			self.st_eris.msg_confirms.pop(nonce, None)
 			if not (err.status == 400 and err.get_key('code') == 200000): raise
 			raise IRCBridgeSignal('blocked' + str_tpl(' - {}', err.get_key('message')))
 		except asyncio.TimeoutError:
-			if res: await aio_task_cancel(res)
-			raise IRCBridgeSignal('msg-confirm-timed-out')
-		finally: self.st_eris.msg_confirms.pop(nonce, None)
+			if fut and fut.done(): res = dict(id=fut.result())
+			else:
+				self.st_eris.msg_confirms.pop(nonce, None)
+				raise IRCBridgeSignal(f'msg-{stage}-timed-out')
+		except:
+			self.st_eris.msg_confirms.pop(nonce, None)
+			raise
 
 		try: flake_res = res['id']
-		except: raise DiscordError(f'Invalid response: {res}')
-		if flake_gw != flake_res: self.log.warning(
-			'Same-nonce sent/received msg-id mismatch: {} != {}', flake_gw, flake_res )
+		except:
+			self.st_eris.msg_confirms.pop(nonce, None)
+			raise DiscordError(f'Invalid response: {res}')
+		if fut.done() and fut.result() != flake_res: self.log.warning(
+			'Same-nonce sent/received msg-id mismatch: {} != {}', fut.result(), flake_res )
+		elif self.st_eris.msg_confirms.get(nonce) is fut:
+			asyncio.get_running_loop().call_later(
+				self.conf.discord_msg_confirm_timeout,
+				self.msg_confirm_expire, nonce, fut )
 		self.log.debug('Sending of msg {} confirmed: {}', flake_res, self._repr(line))
 		cc.last_msg_sent.update(flake=flake_res, line=line)
 		self.conf.state_watch(cc.id, ts, self.bridge.uid_start)

@@ -219,6 +219,40 @@ class PayloadTests(unittest.TestCase):
         self.assertNotIn("not-a-snowflake", protocol.dickord_tags(discord_msg_id="not-a-snowflake"))
 
 
+class MessageSendTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rest_response_confirms_without_gateway_echo(self):
+        discord = rdircd.Discord.__new__(rdircd.Discord)
+        discord.st_eris = rdircd.adict(enabled=True, msg_confirms={})
+        discord.conf = rdircd.adict(
+            discord_thread_redirect_prefixed_responses_from_parent_chan=False,
+            discord_thread_id_prefix="=",
+            discord_msg_confirm_timeout=1,
+            state_watch=lambda *_args: None,
+        )
+        discord.bridge = rdircd.adict(uid_start="test")
+        discord.log = Log()
+        discord._repr = repr
+        discord.flake_build = lambda _ts: "123"
+        discord.cmd_msg_parse_flags = lambda line: (line, 0)
+        discord.cmd_msg_emojify = lambda _guild, line: line
+        discord.cmd_msg_mentionify = mock.AsyncMock(side_effect=lambda _guild, line: line)
+        discord.conn_req = mock.AsyncMock(return_value={"id": "999"})
+        channel = rdircd.adict(
+            id="20",
+            name="test",
+            gg=rdircd.adict(id="10"),
+            threads={},
+            last_msg_sent=rdircd.adict(),
+        )
+
+        result = await discord.cmd_msg_send(channel, "hello")
+        self.assertEqual(result, "999")
+        self.assertIn("123", discord.st_eris.msg_confirms)
+        future = discord.st_eris.msg_confirms["123"]
+        discord.msg_confirm_expire("123", future)
+        self.assertNotIn("123", discord.st_eris.msg_confirms)
+
+
 class HTTPTests(unittest.IsolatedAsyncioTestCase):
     def make_session(self):
         session = rdircd.DiscordSession.__new__(rdircd.DiscordSession)

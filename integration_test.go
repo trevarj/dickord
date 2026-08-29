@@ -187,6 +187,12 @@ func TestErgoIntegration(t *testing.T) {
 	if got := waitOutbound(t, fake.outbound, "cached Discord mention"); got.text != "<@"+testDiscordUserID+"> hi" {
 		t.Fatalf("cached mention=%+v", got)
 	}
+	if err := owner.Privmsg("#discord.me.chat.alice", "notice how @Alice looked"); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitOutbound(t, fake.outbound, "cached inline Discord mention"); got.text != "notice how <@"+testDiscordUserID+"> looked" {
+		t.Fatalf("cached inline mention=%+v", got)
+	}
 
 	if err := owner.SendWithTags(map[string]string{"+reply": "unknown-ergo-msgid"}, "PRIVMSG", "#discord.me.chat.alice", "unknown reply target"); err != nil {
 		t.Fatal(err)

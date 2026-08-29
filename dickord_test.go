@@ -186,6 +186,12 @@ func TestRelayAddressTranslation(t *testing.T) {
 			t.Errorf("translateRelayAddress(%q)=%q, want %q", test.input, actual, test.expected)
 		}
 	}
+	if actual := bridge.translateDiscordMentions("#one", "notice how @Crispy looked"); actual != "notice how <@123456789012345678> looked" {
+		t.Fatalf("inline mention=%q", actual)
+	}
+	if actual := bridge.translateDiscordMentions("#two", "notice how @Crispy looked"); actual != "notice how @Crispy looked" {
+		t.Fatalf("unknown inline mention=%q", actual)
+	}
 }
 
 func TestDiscordCorrelationGroupsAndEviction(t *testing.T) {

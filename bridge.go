@@ -1359,7 +1359,7 @@ func (b *Bridge) onErgoMessage(conn *ircevent.Connection, msg ircmsg.Message) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
-	text = b.translateRelayAddress(source, text)
+	text = b.translateDiscordMentions(source, text)
 	_, ergoMsgID := msg.GetTag("msgid")
 	for index, line := range splitUTF8(text, 380) {
 		tags := make(map[string]string, 2)
@@ -1402,6 +1402,42 @@ func authorizedMessage(msg ircmsg.Message, owners map[string]struct{}) (account,
 		return account, "unauthorized-account", false
 	}
 	return account, "", true
+}
+
+func (b *Bridge) translateDiscordMentions(source, text string) string {
+	text = b.translateRelayAddress(source, text)
+	source = ircCasefold(source)
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	var out strings.Builder
+	last := 0
+	for i := 0; i < len(text); i++ {
+		if text[i] != '@' || i > 0 && !strings.ContainsRune(" \t\r\n", rune(text[i-1])) {
+			continue
+		}
+		end := i + 1
+		for end < len(text) && !strings.ContainsRune(" \t\r\n,;@+!?:()", rune(text[end])) {
+			end++
+		}
+		if end == i+1 {
+			continue
+		}
+		nick := text[i+1 : end]
+		userID := b.discordUsers[discordUserKey{source: source, nick: ircCasefold(nick)}]
+		if !validDiscordID(userID) {
+			continue
+		}
+		out.WriteString(text[last:i])
+		out.WriteString("<@" + userID + ">")
+		last = end
+		i = end - 1
+	}
+	if last == 0 {
+		return text
+	}
+	out.WriteString(text[last:])
+	return out.String()
 }
 
 func (b *Bridge) translateRelayAddress(source, text string) string {
