@@ -37,6 +37,7 @@ const (
 	testSelfDiscordMessageID     = "111111111111111111"
 	testMultilineDiscordID       = "333333333333333333"
 	testCaughtUpDiscordID        = "555555555555555555"
+	testReplyDiscordID           = "666666666666666666"
 )
 
 type capturedReaction struct {
@@ -149,6 +150,28 @@ func TestErgoIntegration(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Discord-to-Ergo relay timed out")
+	}
+
+	fake.SendDiscordReply(testReplyDiscordID, testDiscordMessageID, "Discord native reply")
+	select {
+	case msg := <-ownerMessages:
+		_, reply := msg.GetTag("+reply")
+		if msg.Params[1] != "Discord native reply" || reply != ircMessageID || strings.Contains(msg.Params[1], "-- re:") {
+			t.Fatalf("Discord reply was not native: params=%q reply=%q", msg.Params, reply)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Discord native reply timed out")
+	}
+
+	fake.SendDiscordReply("777777777777777777", "888888888888888888", "unknown Discord reply")
+	select {
+	case msg := <-ownerMessages:
+		_, reply := msg.GetTag("+reply")
+		if msg.Params[1] != "unknown Discord reply" || reply != "" {
+			t.Fatalf("unknown Discord reply fallback: params=%q reply=%q", msg.Params, reply)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("unknown Discord reply fallback timed out")
 	}
 
 	if err := owner.SendWithTags(map[string]string{"+reply": ircMessageID}, "PRIVMSG", "#discord.me.chat.alice", "native reply"); err != nil {
@@ -757,6 +780,10 @@ func (f *fakeRDirCD) SendDiscordID(messageID string, lines ...string) {
 	for _, text := range lines {
 		f.send("@+dickord/discord-msgid=" + messageID + ";+dickord/discord-userid=" + testDiscordUserID + " :Alice!Alice@discord PRIVMSG #me.chat.alice :" + text)
 	}
+}
+
+func (f *fakeRDirCD) SendDiscordReply(messageID, replyMessageID, text string) {
+	f.send("@+dickord/discord-msgid=" + messageID + ";+dickord/discord-userid=" + testDiscordUserID + ";+dickord/discord-reply-msgid=" + replyMessageID + " :Alice!Alice@discord PRIVMSG #me.chat.alice :" + text)
 }
 
 func (f *fakeRDirCD) SendSelfDiscord(nick, text string) {

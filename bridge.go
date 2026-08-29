@@ -17,8 +17,9 @@ import (
 )
 
 type discordMessageRef struct {
-	source    string
-	messageID string
+	source         string
+	messageID      string
+	replyMessageID string
 }
 
 type discordRefKey struct {
@@ -697,6 +698,10 @@ func (b *Bridge) onRDirCDMessage(conn *ircevent.Connection, msg ircmsg.Message, 
 	}
 	_, event := msg.GetTag("+dickord/event")
 	_, discordMessageID := msg.GetTag("+dickord/discord-msgid")
+	_, discordReplyMessageID := msg.GetTag("+dickord/discord-reply-msgid")
+	if !validDiscordID(discordReplyMessageID) {
+		discordReplyMessageID = ""
+	}
 	switch event {
 	case "delete":
 		if validDiscordID(discordMessageID) {
@@ -726,7 +731,9 @@ func (b *Bridge) onRDirCDMessage(conn *ircevent.Connection, msg ircmsg.Message, 
 		b.relayReactionWithRetry(destination, nick, reaction, text, notice, 50, target, discordMessageID)
 		return
 	}
-	b.relayToErgo(destination, nick, text, notice, discordMessageRef{source: target, messageID: discordMessageID})
+	b.relayToErgo(destination, nick, text, notice, discordMessageRef{
+		source: target, messageID: discordMessageID, replyMessageID: discordReplyMessageID,
+	})
 }
 
 func validDiscordID(value string) bool {
@@ -774,6 +781,15 @@ func (b *Bridge) relayToErgo(destination, nick, text string, notice bool, discor
 	conn := b.ergo
 	ready := b.ergoRegistered && b.operReady
 	relay := b.relayReady
+	var replyMsgID string
+	if discord.replyMessageID != "" {
+		ids := b.ergoByDiscord[discordRefKey{
+			source: ircCasefold(discord.source), messageID: discord.replyMessageID,
+		}]
+		if len(ids) > 0 {
+			replyMsgID = ids[0]
+		}
+	}
 	b.mu.RUnlock()
 	if conn == nil || !ready {
 		return
@@ -786,9 +802,12 @@ func (b *Bridge) relayToErgo(destination, nick, text string, notice bool, discor
 			maxPayload = 400
 		}
 		_, labeled := conn.AcknowledgedCaps()["labeled-response"]
-		for _, line := range splitUTF8(text, maxPayload) {
+		for index, line := range splitUTF8(text, maxPayload) {
 			nonce := b.addPendingRelay(destination, nick, line, discord)
 			tags := map[string]string{"+dickord/nonce": nonce}
+			if index == 0 && replyMsgID != "" {
+				tags["+reply"] = replyMsgID
+			}
 			if labeled {
 				err := conn.SendWithLabel(func(response *ircevent.Batch) {
 					if response == nil {

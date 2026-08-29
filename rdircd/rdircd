@@ -1956,12 +1956,13 @@ class IRCProtocol(asyncio.Protocol):
 		return str(value).replace('\\', '\\\\').replace(';', '\\:').replace(' ', '\\s').replace('\r', '\\r').replace('\n', '\\n')
 
 	def dickord_tags( self, discord_msg_id=None, discord_user_id=None,
-			discord_self=False, discord_event=None, discord_emoji=None,
+			discord_reply_msg_id=None, discord_self=False, discord_event=None, discord_emoji=None,
 			discord_emoji_api=None, discord_burst=False ):
 		tags = list()
 		for tag, value in [
 				('+dickord/discord-msgid', discord_msg_id),
-				('+dickord/discord-userid', discord_user_id) ]:
+				('+dickord/discord-userid', discord_user_id),
+				('+dickord/discord-reply-msgid', discord_reply_msg_id) ]:
 			if value and str(value).isdigit(): tags.append(f'{tag}={value}')
 			elif value: self.log.warning('Ignoring invalid Discord snowflake tag {}={!r}', tag, value)
 		for tag, value in [
@@ -1973,7 +1974,8 @@ class IRCProtocol(asyncio.Protocol):
 		return '' if not tags else f'@{";".join(tags)} '
 
 	def cmd_msg_chan( self, nick, chan, text, notice=False, joined=False,
-			discord_msg_id=None, discord_user_id=None, discord_self=False,
+			discord_msg_id=None, discord_user_id=None, discord_reply_msg_id=None,
+			discord_self=False,
 			discord_event=None, discord_emoji=None, discord_emoji_api=None,
 			discord_burst=False ):
 		'''Send message to channel that this IRC client is connected to.
@@ -1987,8 +1989,8 @@ class IRCProtocol(asyncio.Protocol):
 				and not notice and not irc_name_eq(nick, self.st_irc.nick) ):
 			self.send(f':{self.src_discord(nick)} JOIN {chan}')
 		tags = self.dickord_tags(
-			discord_msg_id, discord_user_id, discord_self, discord_event,
-			discord_emoji, discord_emoji_api, discord_burst )
+			discord_msg_id, discord_user_id, discord_reply_msg_id,
+			discord_self, discord_event, discord_emoji, discord_emoji_api, discord_burst )
 		self.send(f'{tags}:{self.src_discord(nick)} {msg_type} {chan} :{text}')
 		self.st_irc.typing_repeat.active.pop((nick, chan), None)
 
@@ -2303,12 +2305,13 @@ class Discord:
 				result.messages.append(adict(
 					nick=nick, line=line.strip(), tags=tags, ts=msg_ts, msg_id=m.id,
 					discord_user_id=author_id,
+					discord_reply_msg_id=self.session.op_msg_reply_id(m),
 					discord_self=bool(author_id and author_id == self.st_da.user.get('id')) ))
 			if flake == flake_last or len(msg_batch) < hwm: break
 		if stopped: result.messages.append(adict(
 			line=f'<...stopped history-fetch after configured message-limit [ {limit:,d} ]...>',
 			nick=None, tags=adict(), ts=result.cursor_ts, msg_id=None,
-			discord_user_id='', discord_self=False ))
+			discord_user_id='', discord_reply_msg_id=None, discord_self=False ))
 		result.messages.sort(key=op.itemgetter('ts'))
 		return result
 
@@ -3804,6 +3807,7 @@ class DiscordSession:
 		#  prefixes and call cmd_msg_recv multiple times for different channels.
 		nick, ts = m.get('author'), time.time()
 		discord_user_id = nick and nick.get('id') or ''
+		discord_reply_msg_id = self.op_msg_reply_id(m)
 		msg_from_self = bool( nick and self.st_da.get('user')
 			and nick.get('id') == self.st_da.user.get('id') )
 		msg_ev, msg_ts = None, self.discord.flake_parse(m.id)
@@ -3874,9 +3878,6 @@ class DiscordSession:
 			tags._prefix = tags.get('_prefix', '') + self.conf.irc_prefix_edit
 			if (td := old_pre.get('update')) and ts - msg_ts > td:
 				tags._prefix += f'[old-msg {ts_iso8601(msg_ts)}] '
-		elif reply := self.op_msg_parse_reply(m, gg):
-			reply_line, reply_tags = reply
-			line = f'{reply_line}\n{line.strip()}'.rstrip(); tags.update(reply_tags)
 
 		if self.conf.discord_embed_info:
 			if act != 'media' and re.search(
@@ -3908,7 +3909,9 @@ class DiscordSession:
 		self.discord.cmd_msg_recv( cc, nick, line.strip(), tags,
 			new_msg_flake=not msg_is_update and m.id, msg_id=m.id,
 			nonce=m.get('nonce'), skip_monitor=skip_mirrored_msg_in_monitor,
-			discord_user_id=discord_user_id, discord_self=msg_from_self,
+			discord_user_id=discord_user_id,
+			discord_reply_msg_id=discord_reply_msg_id,
+			discord_self=msg_from_self,
 			discord_event='edit' if msg_is_update else None )
 
 	def op_msg_media_info(self, m, force_meta=False):
@@ -4243,24 +4246,13 @@ class DiscordSession:
 				tags[k_src] = v
 		return tags
 
-	def op_msg_parse_reply(self, m, gg):
-		if not ( self.conf.irc_inline_reply_quote_len > 0
-			and (ref := m.get('referenced_message'))
-			and (ua := ref.get('author')) and ( ref_nick :=
-				self.discord.bridge.irc_name(self.discord.user_name(ua, m.get('mentions'))) ) ): return
-		if ( self.conf.irc_ref_allow_disabling_pings
-				and (ref_nick in self.discord.bridge.irc_conn_names())
-				and not any(u.username == ua.username for u in m.get('mentions') or list()) ):
-			ref_nick = f'{ref_nick[:-1]}.no@'
-		ref_line, ref_tags = self.op_msg_parse(ref, gg, can_be_empty=True)
-		if not ref_line and ( snapshots :=
-				ref.get('message_reference') and ref.get('message_snapshots') ):
-			ext = self.op_msg_parse_snapshots(m.id, snapshots, gg)
-			for msg in ext.warn: self.log.warning('{}: {}', msg, self._repr(m))
-			ref_line, ref_tags = '\n'.join(ext.lines), ext.tags
-		if ref_line := str_cut(ref_line, self.conf.irc_inline_reply_quote_len):
-			return ( f'-- re:<{ref_nick}> {ref_line}',
-				dict((k,v) for k,v in ref_tags.items() if not k.startswith('_')) )
+	@staticmethod
+	def op_msg_reply_id(m):
+		ref = m.get('message_reference') or adict()
+		if m.get('type') != DiscordSession.c_msg_type.reply or ref.get('type', 0) not in [0, None]:
+			return
+		msg_id = ref.get('message_id')
+		return msg_id if msg_id and str(msg_id).isdigit() else None
 
 	def op_msg_ref(self, msg_id, cc, nick, line, ref=None):
 		'Cache message to reference later in reacts and such'
@@ -4748,6 +4740,7 @@ class RDIRCD:
 						line = f'[{ts_iso8601(m.ts)}] {m.line}'
 						self.cmd_msg_discord( info.cc, m.nick, line, tags=m.tags, conn=conn,
 							discord_msg_id=m.msg_id, discord_user_id=m.discord_user_id,
+							discord_reply_msg_id=m.discord_reply_msg_id,
 							discord_self=m.discord_self )
 					return notice_cmd(f'--- end of replay [{len(history.messages)}]')
 				raise IRCBridgeSignal(f'Invalid log-cmd parameters: {line}')
@@ -5082,6 +5075,7 @@ class RDIRCD:
 				line = f'[{ts_iso8601(m.ts)}] {m.line}'
 				self.cmd_msg_discord( cc, m.nick, line, tags=m.tags, conn=conn,
 					discord_msg_id=m.msg_id, discord_user_id=m.discord_user_id,
+					discord_reply_msg_id=m.discord_reply_msg_id,
 					discord_self=m.discord_self )
 			notice_cmd(f'--- end of replay [{len(history.messages)}]')
 		if self.irc_conns and history.cursor_ts > ts:
@@ -5557,6 +5551,7 @@ class RDIRCD:
 	def cmd_msg_discord( self, cc, nick=None, line=None, name_irc=None,
 			tags=None, ts=None, conn=None, notice=None, skip_monitor=False,
 			msg_id=None, discord_msg_id=None, discord_user_id=None,
+			discord_reply_msg_id=None,
 			discord_self=False, discord_event=None, discord_emoji=None,
 			discord_emoji_api=None, discord_burst=False ) -> bool:
 		'''Sends annotated Discord message to all proxy/monitor IRC channels.
@@ -5608,7 +5603,9 @@ class RDIRCD:
 			for conn, (n, ln) in it.product(conns_joined, enumerate(chan_lines)):
 				conn.cmd_msg_chan( nick, name, ln, notice=notice, joined=joined and not n,
 					discord_msg_id=discord_msg_id or msg_id,
-					discord_user_id=discord_user_id, discord_self=discord_self,
+					discord_user_id=discord_user_id,
+					discord_reply_msg_id=discord_reply_msg_id if not n else None,
+					discord_self=discord_self,
 					discord_event=discord_event, discord_emoji=discord_emoji,
 					discord_emoji_api=discord_emoji_api, discord_burst=discord_burst )
 

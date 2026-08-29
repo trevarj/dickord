@@ -53,6 +53,7 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         discord.user_name = lambda author: author.get("username") or "unknown"
         discord.session = rdircd.adict(
             st_da=rdircd.adict(user=rdircd.adict(id="7")),
+            op_msg_reply_id=rdircd.DiscordSession.op_msg_reply_id,
             op_msg_parse=lambda message, _guild: (
                 ("" if message.get("ignore") else message.get("content", "")), rdircd.adict()
             ),
@@ -72,7 +73,14 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
                 {"id": "101", "content": "one", "author": {"id": "7", "username": "me"}},
                 {"id": "102", "ignore": True, "author": {"id": "8", "username": "other"}},
             ],
-            [{"id": "103", "content": "three", "author": {"id": "8", "username": "other"}}],
+            [{
+                "id": "103",
+                "content": "three",
+                "type": 19,
+                "author": {"id": "8", "username": "other"},
+                "message_reference": {"message_id": "101"},
+                "referenced_message": {"id": "101"},
+            }],
         ]
         discord, calls = self.make_discord(pages)
         channel = rdircd.adict(id="9", gg=rdircd.adict(id="10"))
@@ -82,6 +90,7 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history.cursor_ts, 103)
         self.assertTrue(history.messages[0].discord_self)
         self.assertEqual(history.messages[1].discord_user_id, "8")
+        self.assertEqual(history.messages[1].discord_reply_msg_id, "101")
 
     async def test_ignored_page_still_advances_cursor(self):
         discord, _calls = self.make_discord([
@@ -172,12 +181,28 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(received[-1]["discord_event"], "react-remove-emoji")
         self.assertEqual(received[-1]["discord_emoji_api"], "Party:123")
 
+    def test_reply_id_only_accepts_native_message_references(self):
+        reply = rdircd.adict(
+            type=19,
+            message_reference=rdircd.adict(message_id="123"),
+            referenced_message=rdircd.adict(id="123"),
+        )
+        self.assertEqual(rdircd.DiscordSession.op_msg_reply_id(reply), "123")
+        reply.message_reference.type = 1
+        self.assertIsNone(rdircd.DiscordSession.op_msg_reply_id(reply))
+        reply.message_reference.type = 0
+        reply.referenced_message = None
+        self.assertEqual(rdircd.DiscordSession.op_msg_reply_id(reply), "123")
+        reply.type = 0
+        self.assertIsNone(rdircd.DiscordSession.op_msg_reply_id(reply))
+
     def test_structured_tags_escape_and_validate(self):
         protocol = rdircd.IRCProtocol.__new__(rdircd.IRCProtocol)
         protocol.log = Log()
         tags = protocol.dickord_tags(
             discord_msg_id="123",
             discord_user_id="456",
+            discord_reply_msg_id="789",
             discord_event="react-add",
             discord_emoji="x; y\\z",
             discord_emoji_api="x:123",
@@ -186,6 +211,7 @@ class PayloadTests(unittest.TestCase):
         )
         self.assertIn("+dickord/discord-msgid=123", tags)
         self.assertIn("+dickord/discord-userid=456", tags)
+        self.assertIn("+dickord/discord-reply-msgid=789", tags)
         self.assertIn("+dickord/event=react-add", tags)
         self.assertIn("+dickord/emoji=x\\:\\sy\\\\z", tags)
         self.assertIn("+dickord/discord-emoji=x:123", tags)
