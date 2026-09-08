@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -168,7 +170,7 @@ func (b *Bridge) newErgoConnection() *ircevent.Connection {
 		Timeout:         20 * time.Second,
 		KeepAlive:       90 * time.Second,
 		ReconnectFreq:   b.cfg.Reconnect.Minimum,
-		MaxLineLen:      512,
+		MaxLineLen:      1024,
 		AllowTruncation: false,
 		Debug:           false,
 		Log:             log.New(slogWriter{b.log, "ergo"}, "", 0),
@@ -354,7 +356,7 @@ func (b *Bridge) newRDirCDConnection(ctx context.Context) *ircevent.Connection {
 		Timeout:         20 * time.Second,
 		KeepAlive:       90 * time.Second,
 		ReconnectFreq:   b.cfg.Reconnect.Minimum,
-		MaxLineLen:      512,
+		MaxLineLen:      1024,
 		AllowTruncation: false,
 		Debug:           false,
 		Log:             log.New(slogWriter{b.log, "rdircd"}, "", 0),
@@ -1422,8 +1424,45 @@ func (b *Bridge) onErgoMessage(conn *ircevent.Connection, msg ircmsg.Message) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
-	text = b.translateDiscordMentions(source, text)
 	_, ergoMsgID := msg.GetTag("msgid")
+	voiceDurationPresent, voiceDuration := msg.GetTag("+dickord/voice-duration")
+	voiceWaveformPresent, voiceWaveform := msg.GetTag("+dickord/voice-waveform")
+	if voiceDurationPresent || voiceWaveformPresent {
+		duration, err := strconv.ParseFloat(voiceDuration, 64)
+		waveform, waveformErr := base64.StdEncoding.Strict().DecodeString(voiceWaveform)
+		voiceURL, urlErr := attachmentHTTPSURL(text)
+		support := conn.ISupport()
+		endpoint := support["FILEHOST"]
+		if endpoint == "" {
+			endpoint = support["draft/FILEHOST"]
+		}
+		if endpoint == "" {
+			endpoint = support["soju.im/FILEHOST"]
+		}
+		filehostURL, endpointErr := attachmentHTTPSURL(endpoint)
+		if !voiceDurationPresent || !voiceWaveformPresent || err != nil || duration <= 0 ||
+			math.IsNaN(duration) || math.IsInf(duration, 0) || waveformErr != nil ||
+			len(waveform) == 0 || len(waveform) > 256 || len(text) > maxAttachmentURLLength ||
+			urlErr != nil || endpointErr != nil || !sameHTTPSOrigin(voiceURL, filehostURL) {
+			b.notifyErgo(destination, "Invalid voice message; expected a FILEHOST URL, positive duration, and 1-256 waveform bytes")
+			return
+		}
+		tags := map[string]string{
+			"+dickord/voice-duration": voiceDuration,
+			"+dickord/voice-waveform": voiceWaveform,
+		}
+		if ergoMsgID != "" {
+			tags["+dickord/ergo-msgid"] = ergoMsgID
+		}
+		if discordReplyID != "" {
+			tags["+dickord/discord-reply-msgid"] = discordReplyID
+		}
+		if err := rdircd.SendWithTags(tags, "PRIVMSG", source, voiceURL.String()); err != nil {
+			b.notifyErgo(destination, "Discord bridge unavailable; voice message not sent")
+		}
+		return
+	}
+	text = b.translateDiscordMentions(source, text)
 	for index, line := range splitUTF8(text, 380) {
 		tags := make(map[string]string, 2)
 		if ergoMsgID != "" {

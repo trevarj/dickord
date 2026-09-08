@@ -458,6 +458,189 @@ class MessageSendTests(unittest.IsolatedAsyncioTestCase):
         discord.msg_confirm_expire("123", future)
         self.assertNotIn("123", discord.st_eris.msg_confirms)
 
+    @staticmethod
+    def voice_response(body, *, status=200, content_type="audio/ogg", length=None):
+        class Content:
+            async def iter_chunked(self, _size):
+                yield body
+
+        response = rdircd.adict(
+            status=status,
+            headers={"Content-Length": str(len(body) if length is None else length)},
+            content_type=content_type,
+            content=Content(),
+            released=False,
+        )
+        response.release = lambda: response.update(released=True)
+        return response
+
+    def make_voice_discord(self, response):
+        discord = rdircd.Discord.__new__(rdircd.Discord)
+        discord.st_eris = rdircd.adict(enabled=True, msg_confirms={})
+        discord.conf = rdircd.adict(
+            discord_thread_redirect_prefixed_responses_from_parent_chan=False,
+            discord_thread_id_prefix="=",
+            discord_msg_confirm_timeout=1,
+            state_watch=mock.Mock(),
+        )
+        discord.bridge = rdircd.adict(uid_start="test")
+        discord.log = Log()
+        discord._repr = repr
+        discord.flake_build = lambda _ts: "123"
+        request = mock.AsyncMock(return_value=response)
+        discord.session = rdircd.adict(ws=rdircd.adict(http=rdircd.adict(request=request)))
+        discord.conn_req = mock.AsyncMock(return_value={"id": "999"})
+        channel = rdircd.adict(
+            id="20",
+            name="test",
+            gg=rdircd.adict(id="10"),
+            threads={},
+            last_msg_sent=rdircd.adict(flake="old", line="old"),
+        )
+        return discord, channel, request
+
+    def test_privmsg_parses_both_voice_tags(self):
+        protocol = rdircd.IRCProtocol.__new__(rdircd.IRCProtocol)
+        protocol.cmd_msg_from_irc = mock.Mock()
+        protocol.recv_cmd_privmsg(rdircd.adict(
+            params=["#test", "https://files.example/voice.ogg"],
+            tags={
+                "+dickord/voice-duration": "1.25",
+                "+dickord/voice-waveform": "AQI=",
+            },
+        ))
+        protocol.cmd_msg_from_irc.assert_called_once_with(
+            "#test", "https://files.example/voice.ogg", from_self=True,
+            ergo_msg_id=None, discord_reply_msg_id=None,
+            voice_duration="1.25", voice_waveform="AQI=",
+        )
+
+    async def test_voice_send_downloads_without_auth_and_posts_exact_multipart(self):
+        audio = b"OggS" + b"\0" * 22 + b"\1" + b"\x13" + b"OpusHead\x01\x01" + b"\0" * 9
+        response = self.voice_response(audio)
+        discord, channel, request = self.make_voice_discord(response)
+
+        class FormData:
+            def __init__(self, **kwargs):
+                self.fields = []
+                self.kwargs = kwargs
+
+            def add_field(self, name, value, **kwargs):
+                self.fields.append((name, value, kwargs))
+
+        url = "https://files.example/voice.ogg"
+        with mock.patch.object(rdircd.aiohttp, "FormData", FormData):
+            result = await discord.cmd_msg_send_voice(
+                channel, url, "1.25", "AQI=", reply_msg_id="456"
+            )
+
+        self.assertEqual(result, "999")
+        request.assert_awaited_once_with(
+            "get", url, allow_redirects=False, auto_decompress=False
+        )
+        discord.conn_req.assert_awaited_once()
+        post = discord.conn_req.await_args
+        self.assertEqual(post.args, ("channels/20/messages",))
+        self.assertEqual(post.kwargs["m"], "post")
+        self.assertNotIn("json", post.kwargs)
+        fields = post.kwargs["data"].fields
+        self.assertEqual([field[0] for field in fields], ["payload_json", "files[0]"])
+        self.assertEqual(post.kwargs["data"].kwargs, {"quote_fields": False})
+        payload = rdircd.json.loads(fields[0][1])
+        self.assertEqual(payload, {
+            "nonce": "123",
+            "enforce_nonce": True,
+            "flags": 8192,
+            "allowed_mentions": {"parse": ["users"], "replied_user": False},
+            "message_reference": {
+                "message_id": "456",
+                "fail_if_not_exists": False,
+            },
+            "attachments": [{
+                "id": 0,
+                "filename": "voice-message.ogg",
+                "duration_secs": 1.25,
+                "waveform": "AQI=",
+            }],
+        })
+        self.assertEqual(fields[0][2], {"content_type": "application/json"})
+        self.assertEqual(fields[1], (
+            "files[0]",
+            audio,
+            {"filename": "voice-message.ogg", "content_type": "audio/ogg"},
+        ))
+        self.assertEqual(channel.last_msg_sent, {"flake": "old", "line": "old"})
+        self.assertTrue(response.released)
+        self.assertIn("123", discord.st_eris.msg_confirms)
+        discord.msg_confirm_expire("123", discord.st_eris.msg_confirms["123"])
+
+    async def test_invalid_voice_metadata_and_download_never_post(self):
+        audio = b"OggS" + b"\0" * 22 + b"\1" + b"\x13" + b"OpusHead\x01\x01" + b"\0" * 9
+        for duration, waveform in [("0", "AQI="), ("1", "not-base64")]:
+            with self.subTest(duration=duration, waveform=waveform):
+                discord, channel, request = self.make_voice_discord(
+                    self.voice_response(audio)
+                )
+                with self.assertRaises(rdircd.IRCBridgeSignal):
+                    await discord.cmd_msg_send_voice(
+                        channel, "https://files.example/voice.ogg", duration, waveform
+                    )
+                request.assert_not_awaited()
+                discord.conn_req.assert_not_awaited()
+
+        for response in [
+            self.voice_response(audio, status=302),
+            self.voice_response(audio, content_type="text/plain"),
+            self.voice_response(b"not an ogg opus file"),
+            self.voice_response(b"OggS" + b"\0" * 22 + b"\1" + b"\x08" + b"OpusHead"),
+        ]:
+            with self.subTest(status=response.status, content_type=response.content_type):
+                discord, channel, _request = self.make_voice_discord(response)
+                with self.assertRaises(rdircd.IRCBridgeSignal):
+                    await discord.cmd_msg_send_voice(
+                        channel, "https://files.example/voice.ogg", "1", "AQI="
+                    )
+                discord.conn_req.assert_not_awaited()
+
+    async def test_queue_routes_voice_tags_without_changing_plain_url_path(self):
+        bridge = rdircd.RDIRCD.__new__(rdircd.RDIRCD)
+        bridge.irc_msg_queue = asyncio.Queue()
+        bridge.irc_chans_sys = {}
+        bridge.irc_msg_translate_preq = lambda line: line
+        bridge.irc_msg_translate_postq = mock.Mock(side_effect=lambda _info, line: line)
+        bridge.irc_discord_info = lambda _name: rdircd.adict(cc="channel")
+        bridge._repr = repr
+        bridge.conf = rdircd.adict(
+            _discord_msg_edit_re=rdircd.re.compile(r"(?!x)x"),
+            _discord_msg_del_re=rdircd.re.compile(r"(?!x)x"),
+        )
+        bridge.discord = rdircd.adict(
+            cmd_msg_send_voice=mock.AsyncMock(return_value="100"),
+            cmd_msg_send=mock.AsyncMock(return_value="101"),
+        )
+        conn = rdircd.adict(
+            chan_name=lambda _chan: "test",
+            send=mock.Mock(),
+            cmd_msg_chan_sys=mock.Mock(),
+        )
+        url = "https://files.example/voice.ogg"
+        bridge.irc_msg(
+            conn, "#test", url, ergo_msg_id="voice-ergo",
+            voice_duration="1", voice_waveform="AQI=",
+        )
+        bridge.irc_msg(conn, "#test", url, ergo_msg_id="text-ergo")
+        bridge.irc_msg_queue.put_nowait(StopIteration)
+
+        await bridge.irc_msg_queue_proc()
+
+        bridge.discord.cmd_msg_send_voice.assert_awaited_once_with(
+            "channel", url, "1", "AQI=", reply_msg_id=None
+        )
+        bridge.discord.cmd_msg_send.assert_awaited_once_with(
+            "channel", url, reply_msg_id=None
+        )
+        self.assertEqual(conn.send.call_count, 2)
+
 
 class HTTPTests(unittest.IsolatedAsyncioTestCase):
     def make_session(self):

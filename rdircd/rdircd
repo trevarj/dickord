@@ -9,7 +9,7 @@ import contextlib as cl, datetime as dt, pathlib as pl, traceback as tb
 import collections as cs, collections.abc as cs_abc, urllib.parse as up
 import os, sys, errno, io, stat, re, time, secrets, enum, json, zlib, gzip, math
 import asyncio, socket, signal, inspect, configparser, tempfile, fnmatch
-import pickle, hashlib, base64, random, textwrap, unicodedata, string, ast
+import pickle, hashlib, base64, binascii, random, textwrap, unicodedata, string, ast
 import logging, logging.handlers
 
 import aiohttp # https://aiohttp.readthedocs.io/
@@ -28,7 +28,7 @@ class RDIRCDConfigBase:
 	#  for example: 1/4:5 (interval=0.25s, rate=4/s, burst=5), 5 (burst=1), 0.5:10, 20:30,
 	#  and also special "0" value can be used as "no rate limit", or "inf" for "always block".
 
-	version = '26.07.2-dickord.1' # git-version: py-str
+	version = '26.07.2-dickord.2' # git-version: py-str
 
 	auth_email = '' # discord account email, used to login there
 	auth_password = ''
@@ -1906,7 +1906,9 @@ class IRCProtocol(asyncio.Protocol):
 		if discord_reply_msg_id and not discord_reply_msg_id.isdigit(): discord_reply_msg_id = None
 		self.cmd_msg_from_irc( target, text, from_self=True,
 			ergo_msg_id=m.tags.get('+dickord/ergo-msgid'),
-			discord_reply_msg_id=discord_reply_msg_id )
+			discord_reply_msg_id=discord_reply_msg_id,
+			voice_duration=m.tags.get('+dickord/voice-duration'),
+			voice_waveform=m.tags.get('+dickord/voice-waveform') )
 
 	def recv_cmd_notice(self, target, text):
 		self.cmd_msg_from_irc(target, text, notice=True, from_self=True)
@@ -1924,7 +1926,8 @@ class IRCProtocol(asyncio.Protocol):
 			# Doesn't actually removes channels, as they get rename-notification there
 
 	def cmd_msg_from_irc( self, target, text, notice=False, from_self=False,
-			ergo_msg_id=None, discord_reply_msg_id=None ):
+			ergo_msg_id=None, discord_reply_msg_id=None,
+			voice_duration=None, voice_waveform=None ):
 		'''Handler for messages posted from IRC.
 			With notice=True message is only handled in irc, without proxying it to discord.'''
 		msg_type = 'PRIVMSG' if not notice else 'NOTICE'
@@ -1943,7 +1946,8 @@ class IRCProtocol(asyncio.Protocol):
 				if name not in conn.st_irc.chans: self.cmd_join(chan) # from chan_auto_join_re
 				conn.send(f':{self.src_self()} {msg_type} {chan} :{text}')
 			if not notice: self.bridge.irc_msg( self, chan, text, ergo_msg_id=ergo_msg_id,
-				discord_reply_msg_id=discord_reply_msg_id )
+				discord_reply_msg_id=discord_reply_msg_id,
+				voice_duration=voice_duration, voice_waveform=voice_waveform )
 		else:
 			if not (conn := self.bridge.cmd_conn(target)):
 				if not notice: self.send(401, target, ':No such nick/channel')
@@ -2366,8 +2370,9 @@ class Discord:
 	@classmethod
 	def message_payload(cls, content, nonce, flags=0, reply_msg_id=None):
 		payload = dict(
-			content=content, nonce=nonce, enforce_nonce=True, flags=flags,
+			nonce=nonce, enforce_nonce=True, flags=flags,
 			allowed_mentions=cls.allowed_mentions() )
+		if content is not None: payload['content'] = content
 		if reply_msg_id:
 			payload['message_reference'] = dict(
 				message_id=reply_msg_id, fail_if_not_exists=False )
@@ -2408,7 +2413,53 @@ class Discord:
 
 	@_cmd_msg_err_wrap
 	async def cmd_msg_send(self, cc, line, reply_msg_id=None):
-		'Relay message from IRC to Discord.'
+		'Relay a text message from IRC to Discord.'
+		return await self._cmd_msg_send(cc, line, reply_msg_id=reply_msg_id)
+
+	@_cmd_msg_err_wrap
+	async def cmd_msg_send_voice(
+			self, cc, url, duration, waveform, reply_msg_id=None ):
+		'Relay an Ogg Opus voice message from IRC to Discord.'
+		return await self._cmd_msg_send(
+			cc, url, reply_msg_id=reply_msg_id, voice=(duration, waveform) )
+
+	async def _cmd_msg_voice_download(self, url):
+		try: parsed = up.urlsplit(url)
+		except (TypeError, ValueError): raise IRCBridgeSignal('voice-invalid-url')
+		if ( parsed.scheme != 'https' or not parsed.hostname or '#' in url
+				or parsed.username is not None or parsed.password is not None ):
+			raise IRCBridgeSignal('voice-invalid-url')
+
+		res = await self.session.ws.http.request(
+			'get', url, allow_redirects=False, auto_decompress=False )
+		try:
+			if res.status != 200: raise IRCBridgeSignal(f'voice-download-http={res.status}')
+			size_raw = str(res.headers.get('Content-Length') or '')
+			if not re.fullmatch(r'[0-9]+', size_raw):
+				raise IRCBridgeSignal('voice-download-size')
+			if not 1 <= (size := int(size_raw)) <= 25 * 2**20:
+				raise IRCBridgeSignal('voice-download-size')
+			if res.content_type != 'audio/ogg':
+				raise IRCBridgeSignal('voice-download-type')
+			data = bytearray()
+			async for chunk in res.content.iter_chunked(64 * 2**10):
+				if len(chunk) > size - len(data):
+					raise IRCBridgeSignal('voice-download-size')
+				data.extend(chunk)
+			if len(data) != size:
+				raise IRCBridgeSignal('voice-download-size')
+		finally: res.release()
+
+		page_segments = data[26] if len(data) > 26 else 0
+		opus_offset = 27 + page_segments
+		header = data[opus_offset:opus_offset + 19]
+		if ( not data.startswith(b'OggS') or not page_segments or data[27] != 19
+				or len(header) != 19 or header[:8] != b'OpusHead'
+				or header[8] != 1 or header[9] not in [1, 2] or header[18] != 0 ):
+			raise IRCBridgeSignal('voice-invalid-audio')
+		return data
+
+	async def _cmd_msg_send(self, cc, line, reply_msg_id=None, voice=None):
 		if not self.st_eris.enabled: raise IRCBridgeSignal('no-discord-conn')
 
 		if ( self.conf.discord_thread_redirect_prefixed_responses_from_parent_chan
@@ -2422,15 +2473,43 @@ class Discord:
 		fut, res, stage = None, None, 'prepare'
 		try:
 			async with aio_timeout(self.conf.discord_msg_confirm_timeout):
-				line, flags = self.cmd_msg_parse_flags(line)
-				line_tagged = self.cmd_msg_emojify(cc.gg, line)
-				line_tagged = await self.cmd_msg_mentionify(cc.gg.id, line_tagged)
-				payload = self.message_payload(
-					line_tagged, nonce, flags=flags, reply_msg_id=reply_msg_id )
+				if voice is None:
+					line, flags = self.cmd_msg_parse_flags(line)
+					line_tagged = self.cmd_msg_emojify(cc.gg, line)
+					line_tagged = await self.cmd_msg_mentionify(cc.gg.id, line_tagged)
+					req_kws = dict(json=self.message_payload(
+						line_tagged, nonce, flags=flags, reply_msg_id=reply_msg_id ))
+				else:
+					duration_raw, waveform = voice
+					try: duration = float(duration_raw)
+					except (TypeError, ValueError):
+						raise IRCBridgeSignal('voice-invalid-duration')
+					if not duration > 0 or not math.isfinite(duration):
+						raise IRCBridgeSignal('voice-invalid-duration')
+					try: waveform_raw = base64.b64decode(waveform, validate=True)
+					except (binascii.Error, TypeError, ValueError):
+						raise IRCBridgeSignal('voice-invalid-waveform')
+					if ( not 1 <= len(waveform_raw) <= 256
+							or base64.b64encode(waveform_raw).decode() != waveform ):
+						raise IRCBridgeSignal('voice-invalid-waveform')
+					audio = await self._cmd_msg_voice_download(line)
+					payload = self.message_payload(
+						None, nonce, flags=self.c_msg_flags.is_voice_message,
+						reply_msg_id=reply_msg_id )
+					payload['attachments'] = [dict(
+						id=0, filename='voice-message.ogg',
+						duration_secs=duration, waveform=waveform )]
+					form = aiohttp.FormData(quote_fields=False)
+					form.add_field(
+						'payload_json', json.dumps(payload), content_type='application/json' )
+					form.add_field(
+						'files[0]', audio, filename='voice-message.ogg',
+						content_type='audio/ogg' )
+					req_kws = dict(data=form)
 				fut = self.st_eris.msg_confirms[nonce] = asyncio.Future()
 				stage = 'post'
 				res = await self.conn_req(
-					f'channels/{cc.id}/messages', m='post', json=payload )
+					f'channels/{cc.id}/messages', m='post', **req_kws )
 		except DiscordHTTPError as err:
 			self.st_eris.msg_confirms.pop(nonce, None)
 			if not (err.status == 400 and err.get_key('code') == 200000): raise
@@ -2455,7 +2534,7 @@ class Discord:
 				self.conf.discord_msg_confirm_timeout,
 				self.msg_confirm_expire, nonce, fut )
 		self.log.debug('Sending of msg {} confirmed: {}', flake_res, self._repr(line))
-		cc.last_msg_sent.update(flake=flake_res, line=line)
+		if voice is None: cc.last_msg_sent.update(flake=flake_res, line=line)
 		self.conf.state_watch(cc.id, ts, self.bridge.uid_start)
 		return flake_res
 
@@ -4807,7 +4886,8 @@ class RDIRCD:
 		conn.cmd_msg_self(info)
 		conn.cmd_msg_self(f'--- [{id_str}] end')
 
-	def irc_msg(self, conn, chan, line, ergo_msg_id=None, discord_reply_msg_id=None):
+	def irc_msg( self, conn, chan, line, ergo_msg_id=None, discord_reply_msg_id=None,
+			voice_duration=None, voice_waveform=None ):
 		'Called with a new msg, posted by IRC user in any channel'
 		name = conn.chan_name(chan)
 		if sys_type := self.irc_chans_sys.get(name):
@@ -4817,7 +4897,8 @@ class RDIRCD:
 			conn.cmd_msg_chan_sys(chan, f'Discarded {{irc-msg-queue-failed}}: {line}')
 		else: self.irc_msg_queue.put_nowait( adict(
 			conn=conn, chan=chan, name=name, line=line, ergo_msg_id=ergo_msg_id,
-			discord_reply_msg_id=discord_reply_msg_id ) )
+			discord_reply_msg_id=discord_reply_msg_id,
+			voice_duration=voice_duration, voice_waveform=voice_waveform ) )
 
 	def irc_delete(self, conn, chan, msg_id):
 		'Called for an IRCv3 redaction targeting a relayed Discord message.'
@@ -4880,7 +4961,14 @@ class RDIRCD:
 				try:
 					if not (info := self.irc_discord_info(m.name)):
 						raise IRCBridgeSignal('no-matching-chan')
-					if edit := self.conf._discord_msg_edit_re.search(m.line):
+					discord_msg_id = None
+					voice_duration, voice_waveform = \
+						m.get('voice_duration'), m.get('voice_waveform')
+					if voice_duration is not None or voice_waveform is not None:
+						discord_msg_id = await self.discord.cmd_msg_send_voice(
+							info.cc, m.line, voice_duration, voice_waveform,
+							reply_msg_id=m.discord_reply_msg_id )
+					elif edit := self.conf._discord_msg_edit_re.search(m.line):
 						await self.discord.cmd_msg_edit_last(
 							info.cc, edit.group('aaa'), edit.group('bbb') )
 					elif self.conf._discord_msg_del_re.search(m.line):
@@ -4889,10 +4977,11 @@ class RDIRCD:
 						line = self.irc_msg_translate_postq(info, m.line)
 						discord_msg_id = await self.discord.cmd_msg_send(
 							info.cc, line, reply_msg_id=m.discord_reply_msg_id )
-						if m.ergo_msg_id and str(discord_msg_id).isdigit():
-							ergo_msg_id = IRCProtocol.tag_escape(m.ergo_msg_id)
-							m.conn.send( f'@+dickord/discord-msgid={discord_msg_id};'
-								f'+reply={ergo_msg_id} TAGMSG {m.chan}' )
+					if ( discord_msg_id and m.ergo_msg_id
+							and str(discord_msg_id).isdigit() ):
+						ergo_msg_id = IRCProtocol.tag_escape(m.ergo_msg_id)
+						m.conn.send( f'@+dickord/discord-msgid={discord_msg_id};'
+							f'+reply={ergo_msg_id} TAGMSG {m.chan}' )
 
 				except IRCBridgeSignal as err:
 					m.conn.cmd_msg_chan_sys( m.chan,

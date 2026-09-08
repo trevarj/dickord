@@ -449,6 +449,28 @@ func TestAttachmentUploadCancellation(t *testing.T) {
 	}
 }
 
+func TestSameHTTPSOrigin(t *testing.T) {
+	parse := func(raw string) *url.URL {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u
+	}
+	for _, tc := range []struct {
+		a, b string
+		want bool
+	}{
+		{"https://files.example/upload", "https://FILES.example:443/voice.ogg", true},
+		{"https://files.example:444/upload", "https://files.example/voice.ogg", false},
+		{"https://files.example/upload", "https://other.example/voice.ogg", false},
+	} {
+		if got := sameHTTPSOrigin(parse(tc.a), parse(tc.b)); got != tc.want {
+			t.Errorf("sameHTTPSOrigin(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
 func attachmentCDNServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

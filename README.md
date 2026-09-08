@@ -22,6 +22,7 @@ records the pinned upstream commit.
 - Native IRCv3 reactions and message redactions in both directions
 - Native Motd-to-Discord replies and optional typing notifications
 - Discord photo, video, and file attachments rehosted through Ergo's FILEHOST
+- Explicit FILEHOST-to-Discord Ogg Opus voice messages
 
 ## Requirements
 
@@ -138,6 +139,23 @@ or absent FILEHOST support fall back to the existing Discord-link rendering.
 Catch-up uses the same path; replaying an attachment can upload another copy.
 Hosted file access and retention belong to the filehost: redacting an IRC
 message does not delete the uploaded file.
+
+## Voice messages
+
+Discord voice messages require an Ogg Opus file, its duration, and a waveform;
+IRC has no standard voice-message attachment. Upload the recording to the
+FILEHOST advertised by Ergo, then send its URL with Dickord's client-only tags:
+
+```irc
+@+dickord/voice-duration=2.5;+dickord/voice-waveform=AAE= PRIVMSG #discord.example :https://files.example.com/voice-message.ogg
+```
+
+The waveform is standard base64 encoding of 1–256 amplitude bytes. Dickord
+accepts the request only from an authorized owner and only when the HTTPS URL
+has the advertised FILEHOST origin. The source must be a known-size
+`audio/ogg` Ogg Opus file no larger than 25 MiB; downloads do not follow
+redirects or receive Discord credentials. An untagged audio URL remains an
+ordinary text message.
 
 ## Security model
 

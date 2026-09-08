@@ -157,6 +157,20 @@ func attachmentHTTPSURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
+func sameHTTPSOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil || a.Scheme != "https" || b.Scheme != "https" ||
+		!strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return false
+	}
+	port := func(u *url.URL) string {
+		if value := u.Port(); value != "" {
+			return value
+		}
+		return "443"
+	}
+	return port(a) == port(b)
+}
+
 func invalidAttachmentURLText(raw string) bool {
 	return strings.Contains(raw, "#") || strings.IndexFunc(raw, func(r rune) bool {
 		return unicode.IsControl(r) || unicode.IsSpace(r)

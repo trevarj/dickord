@@ -583,6 +583,36 @@ func TestErgoIntegration(t *testing.T) {
 		}
 	}
 
+	voiceURL := filehost.URL + "/files/voice-message.ogg"
+	voiceTags := map[string]string{
+		"+dickord/voice-duration": "2.5",
+		"+dickord/voice-waveform": "AAE=",
+	}
+	if err := owner.SendWithTags(voiceTags, "PRIVMSG", "#discord.me.chat.alice", voiceURL); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitOutbound(t, fake.outbound, "voice message relay"); got.text != voiceURL ||
+		got.tags["+dickord/voice-duration"] != "2.5" || got.tags["+dickord/voice-waveform"] != "AAE=" {
+		t.Fatalf("voice outbound=%+v", got)
+	}
+
+	if err := owner.SendWithTags(voiceTags, "PRIVMSG", "#discord.me.chat.alice", "https://example.com/voice-message.ogg"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-ownerMessages:
+		if len(msg.Params) < 2 || !strings.Contains(msg.Params[1], "Invalid voice message") {
+			t.Fatalf("unexpected invalid voice response: %+v", msg)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("invalid voice response timed out")
+	}
+	select {
+	case got := <-fake.outbound:
+		t.Fatalf("invalid voice message passed: %+v", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+
 	if err := owner.Privmsg("#discord.me.chat.alice", "hello from Ergo"); err != nil {
 		t.Fatal(err)
 	}
