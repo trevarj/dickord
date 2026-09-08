@@ -103,6 +103,212 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history.cursor_ts, 101)
 
 
+class AttachmentTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.conf = rdircd.RDIRCDConfigBase()
+        self.conf.irc_names_join = self.conf.discord_embed_info = False
+        self.conf.discord_msg_interact_cache = False
+        self.conf._irc_dedup_interval = 0
+        self.conf._discord_msg_old_prefix = self.conf._discord_msg_old_ignore = {}
+        self.conf.recv_filters = self.conf.recv_repls = self.conf.unmon_filters = {}
+        for key in (
+            "irc_len_dont_split_re", "discord_terminal_links_re",
+            "discord_embed_info_len_skip_re",
+        ):
+            setattr(self.conf, "_" + key, rdircd.re.compile(getattr(self.conf, key)))
+        self.bridge = rdircd.RDIRCD.__new__(rdircd.RDIRCD)
+        self.bridge.conf, self.bridge.log = self.conf, Log()
+        self.bridge.irc_conns = []
+        self.bridge.st_br = rdircd.adict(
+            did_chan={"20": "test"}, line_dedup=None, d2i={}, i2d={}
+        )
+        self.channel = rdircd.adict(
+            id="20", did="20", name="test", tid=None, private=False,
+            users=rdircd.TimedCacheDict(60),
+            gg=rdircd.adict(id="10", chans={}),
+        )
+        self.channel.gg.chans["20"] = self.channel
+        self.protocol = rdircd.IRCProtocol.__new__(rdircd.IRCProtocol)
+        self.protocol.conf, self.protocol.log = self.conf, Log()
+        self.protocol.st_irc = rdircd.adict(
+            nick="bridge", chans={"test"}, typing_repeat=rdircd.adict(active={})
+        )
+        self.wire = []
+        self.protocol.data_send = self.wire.append
+        self.bridge.cmd_chan_conns = lambda _name: [self.protocol]
+        self.bridge.cmd_msg_monitor = lambda *_args, **_kwargs: None
+        self.discord = rdircd.Discord.__new__(rdircd.Discord)
+        self.discord.bridge, self.discord.conf, self.discord.log = self.bridge, self.conf, Log()
+        self.discord.st_eris = rdircd.adict(enabled=True)
+        self.discord.flake_parse = lambda value: float(value) if value else None
+        self.discord.flake_build = lambda value: str(int(value))
+        self.discord.cmd_user_cache = lambda *_args, **_kwargs: None
+        self.discord.user_name = lambda user: user.get("author", user)["username"]
+        self.session = rdircd.DiscordSession.__new__(rdircd.DiscordSession)
+        self.session.conf, self.session.log, self.session._repr = self.conf, Log(), repr
+        self.session.discord, self.discord.session = self.discord, self.session
+        self.session.st_da = rdircd.adict(
+            user={"id": "7"}, guilds={"10": self.channel.gg}, embed_info={}, icache={}
+        )
+
+    def message(self, content="", urls=(), **kwargs):
+        message = rdircd.adict(
+            id="101", type=19, guild_id="10", channel_id="20",
+            author={"id": "7", "username": "owner"}, content=content,
+            attachments=[{"url": url} for url in urls],
+            message_reference={"message_id": "100"},
+        )
+        message.update(kwargs)
+        return message
+
+    def frames(self):
+        return [self.protocol._parse(line.rstrip(b"\r\n")) for line in self.wire]
+
+    def test_parser_tags_only_actual_attachments_with_terminal_links(self):
+        urls = [
+            "https://cdn.discordapp.com/attachments/10/20/photo.png?ex=1&hm=a;b",
+            "https://cdn.discordapp.com/attachments/10/21/video.mp4?ex=2",
+        ]
+        self.conf.irc_prefix_attachment = "file: "
+        for terminal_links in (False, True):
+            with self.subTest(terminal_links=terminal_links):
+                self.wire.clear()
+                self.conf.discord_terminal_links = terminal_links
+                self.session.op_msg(self.message("file: " + urls[0], urls), "create")
+                frames = self.frames()
+                self.assertEqual(
+                    [frame.tags.get("+dickord/attachment") for frame in frames],
+                    [None, *urls],
+                )
+                self.assertEqual(
+                    [frame.tags.get("+dickord/discord-reply-msgid") for frame in frames],
+                    ["100", None, None],
+                )
+                for frame in frames:
+                    self.assertEqual(frame.tags["+dickord/discord-msgid"], "101")
+                    self.assertEqual(frame.tags["+dickord/discord-userid"], "7")
+                    self.assertEqual(frame.tags["+dickord/self"], "1")
+                    self.assertEqual(frame.src, ":owner!owner@discord")
+                self.assertIn(b"hm=a\\:b", self.wire[1])
+                self.assertEqual("\x1b]8;;" in frames[1].params[1], terminal_links)
+
+        self.wire.clear()
+        self.session.op_msg(self.message("file: " + urls[0]), "create")
+        self.assertEqual([frame.tags.get("+dickord/attachment") for frame in self.frames()], [None])
+
+    async def test_history_attachment_tags_survive_replay_to_another_client(self):
+        url = "https://cdn.discordapp.com/attachments/10/20/photo.png?ex=1"
+        self.conf.irc_prefix_pinned = "saved: "
+        self.discord.conn_req = mock.AsyncMock(return_value=[
+            self.message(urls=[url], pinned=True)
+        ])
+        history = await self.discord.cmd_history(self.channel, 100, hwm=2)
+        message = history.messages[0]
+        for _ in range(2):
+            self.bridge.cmd_msg_discord(
+                self.channel, message.nick, "[history] " + message.line,
+                tags=message.tags, conn=self.protocol,
+                discord_msg_id=message.msg_id, discord_user_id=message.discord_user_id,
+                discord_reply_msg_id=message.discord_reply_msg_id,
+                discord_self=message.discord_self,
+            )
+        self.assertEqual(self.wire[0], self.wire[1])
+        self.assertEqual(len(self.wire), 2)
+        frame = self.frames()[1]
+        self.assertEqual(frame.tags["+dickord/attachment"], url)
+        self.assertEqual(frame.tags["+dickord/discord-reply-msgid"], "100")
+        self.assertEqual(frame.tags["+dickord/self"], "1")
+        self.assertEqual(frame.params[1], "saved: [history] " + self.conf.irc_prefix_attachment + url)
+
+    def test_live_normal_and_snapshot_attachments_keep_their_raw_urls(self):
+        urls = [
+            "https://cdn.discordapp.com/attachments/10/20/photo.png?ex=1",
+            "https://cdn.discordapp.com/attachments/10/21/video.mp4?hm=" + "a" * 600,
+            "https://cdn.discordapp.com/attachments/10/22/other.png?ex=3",
+        ]
+        self.conf.discord_embed_info = True
+        self.session.op_msg(self.message(
+            "caption", urls[:1],
+            message_snapshots=[
+                {"message": self.message("forwarded", [url])} for url in urls[1:]
+            ],
+        ), "create")
+        attachments = [
+            frame for frame in self.frames() if "+dickord/attachment" in frame.tags
+        ]
+        self.assertEqual([frame.tags["+dickord/attachment"] for frame in attachments], urls)
+        self.assertNotIn(urls[1], attachments[1].params[1])  # Existing snapshot preview is truncated.
+        self.assertTrue(all(frame.tags["+dickord/self"] == "1" for frame in attachments))
+
+    def test_long_signed_attachment_is_one_attributed_edit_frame(self):
+        url = "https://cdn.discordapp.com/attachments/10/20/photo.png?hm="
+        url += "a" * (2048 - len(url))
+        self.session.op_msg(self.message(urls=[url]), "update")
+        self.assertEqual(len(self.wire), 1)
+        self.assertLessEqual(len(self.wire[0]), 8192)
+        frame = self.frames()[0]
+        self.assertEqual(frame.tags["+dickord/attachment"], url)
+        self.assertEqual(frame.tags["+dickord/discord-msgid"], "101")
+        self.assertEqual(frame.tags["+dickord/discord-userid"], "7")
+        self.assertEqual(frame.tags["+dickord/discord-reply-msgid"], "100")
+        self.assertEqual(frame.tags["+dickord/self"], "1")
+        self.assertEqual(frame.tags["+dickord/event"], "edit")
+        self.assertEqual(frame.params[1], self.conf.irc_prefix_edit + self.conf.irc_prefix_attachment + url)
+
+    def test_attachment_limits_fall_back_without_duplicate_upload_frames(self):
+        url = "https://cdn.discordapp.com/attachments/10/20/photo.png?hm="
+        for attachment, prefix in (
+            (url + "a" * (2049 - len(url)), "file: "),
+            (url + "a", "padding " * 1100),
+        ):
+            with self.subTest(url_length=len(attachment), prefix_length=len(prefix)):
+                self.wire.clear()
+                self.conf.irc_prefix_attachment = prefix
+                self.session.op_msg(self.message(urls=[attachment]), "create")
+                frames = self.frames()
+                self.assertEqual(" ".join(f.params[1] for f in frames).split(), (prefix + attachment).split())
+                self.assertTrue(all("+dickord/attachment" not in f.tags for f in frames))
+                self.assertTrue(all(f.tags["+dickord/discord-msgid"] == "101" for f in frames))
+                self.assertTrue(all(f.tags["+dickord/self"] == "1" for f in frames))
+                self.assertEqual(
+                    [f.tags["+dickord/discord-reply-msgid"] for f in frames
+                     if "+dickord/discord-reply-msgid" in f.tags],
+                    ["100"],
+                )
+
+    def test_long_text_splits_preserve_escaped_tags_and_only_first_reply(self):
+        text, emoji = "caption " * 100 + "\n" + "continued " * 80, "x; y\\n"
+        self.protocol.cmd_msg_chan(
+            "owner", "test", text, notice=True, discord_msg_id="101",
+            discord_user_id="7", discord_reply_msg_id="100",
+            discord_self=True, discord_emoji=emoji,
+        )
+        frames = self.frames()
+        self.assertEqual(" ".join(frame.params[1] for frame in frames).split(), text.split())
+        for frame in frames:
+            self.assertEqual(frame.cmd, "notice")
+            self.assertEqual(frame.tags["+dickord/discord-msgid"], "101")
+            self.assertEqual(frame.tags["+dickord/discord-userid"], "7")
+            self.assertEqual(frame.tags["+dickord/self"], "1")
+            self.assertEqual(frame.tags["+dickord/emoji"], emoji)
+        self.assertEqual(frames[0].tags["+dickord/discord-reply-msgid"], "100")
+        self.assertTrue(all("+dickord/discord-reply-msgid" not in f.tags for f in frames[1:]))
+
+
+    def test_receive_replacements_keep_provenance_when_rendered_lines_collide(self):
+        url = "https://cdn.discordapp.com/attachments/10/20/photo.png?ex=1"
+        self.conf.irc_prefix_attachment = "file: "
+        self.conf.recv_repls = {"*": [
+            rdircd.adict(re=rdircd.re.compile(r"^drop$"), sub=None, tsb=Log()),
+            rdircd.adict(re=rdircd.re.compile(r"^file: .*"), sub="file preview", tsb=Log()),
+        ]}
+        self.bridge.uid = lambda *_args, **_kwargs: "guild:test"
+        self.session.op_msg(self.message("drop\nfile: " + url, [url]), "create")
+        frames = self.frames()
+        self.assertEqual([frame.params[1] for frame in frames], ["file preview", "file preview"])
+        self.assertEqual([frame.tags.get("+dickord/attachment") for frame in frames], [None, url])
+
+
 class PayloadTests(unittest.TestCase):
     def test_message_payload_restricts_mentions_and_enforces_nonce(self):
         payload = rdircd.Discord.message_payload("hello", "123", reply_msg_id="456")

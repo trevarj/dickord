@@ -63,6 +63,7 @@ type Bridge struct {
 	cfg      RuntimeConfig
 	selector channelSelector
 	log      *slog.Logger
+	uploads  *attachmentUploader
 
 	mu               sync.RWMutex
 	ergo             *ircevent.Connection
@@ -94,6 +95,7 @@ func newBridge(cfg RuntimeConfig, logger *slog.Logger) *Bridge {
 		cfg:              cfg,
 		selector:         newChannelSelector(cfg.Channels),
 		log:              logger,
+		uploads:          newAttachmentUploader(cfg),
 		sourceToDest:     make(map[string]string),
 		destToSource:     make(map[string]string),
 		watchedSources:   make(map[string]bool),
@@ -307,13 +309,15 @@ func (b *Bridge) runRDirCD(ctx context.Context, generation uint64) {
 
 	delay := b.cfg.Reconnect.Minimum
 	for ctx.Err() == nil {
-		conn := b.newRDirCDConnection()
+		connCtx, cancel := context.WithCancel(ctx)
+		conn := b.newRDirCDConnection(connCtx)
 		b.mu.Lock()
 		b.rdircd = conn
 		b.rdircdReady = false
 		b.mu.Unlock()
 		b.log.Info("connecting to rdircd", "address", b.cfg.RDirCD.Address)
 		if err := conn.Connect(); err != nil {
+			cancel()
 			b.log.Error("rdircd connection failed", "error", err)
 			b.clearRDirCD(conn)
 			if !waitContext(ctx, delay) {
@@ -334,12 +338,13 @@ func (b *Bridge) runRDirCD(ctx context.Context, generation uint64) {
 			<-done
 		case <-done:
 		}
+		cancel()
 		b.clearRDirCD(conn)
 		return
 	}
 }
 
-func (b *Bridge) newRDirCDConnection() *ircevent.Connection {
+func (b *Bridge) newRDirCDConnection(ctx context.Context) *ircevent.Connection {
 	conn := &ircevent.Connection{
 		Server:          b.cfg.RDirCD.Address,
 		Nick:            b.cfg.RDirCD.Nick,
@@ -359,8 +364,27 @@ func (b *Bridge) newRDirCDConnection() *ircevent.Connection {
 	conn.AddCallback("322", func(msg ircmsg.Message) { b.onRDirCDListEntry(conn, msg) })
 	conn.AddCallback("323", func(ircmsg.Message) { b.onRDirCDListEnd(conn) })
 	conn.AddCallback("JOIN", func(msg ircmsg.Message) { b.onRDirCDJoin(conn, msg) })
-	conn.AddCallback("PRIVMSG", func(msg ircmsg.Message) { b.onRDirCDMessage(conn, msg, false) })
-	conn.AddCallback("NOTICE", func(msg ircmsg.Message) { b.onRDirCDMessage(conn, msg, true) })
+	// ponytail: one bounded worker preserves attachment/text order; parallelize only
+	// if upload throughput requires it. Backpressure bounds pending message memory.
+	messages := make(chan ircmsg.Message, 64)
+	enqueue := func(msg ircmsg.Message) {
+		select {
+		case messages <- msg:
+		case <-ctx.Done():
+		}
+	}
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg := <-messages:
+				b.onRDirCDMessage(ctx, conn, msg, msg.Command == "NOTICE")
+			}
+		}
+	}()
+	conn.AddCallback("PRIVMSG", enqueue)
+	conn.AddCallback("NOTICE", enqueue)
 	conn.AddCallback("TAGMSG", func(msg ircmsg.Message) { b.onRDirCDTagMessage(conn, msg) })
 	conn.AddCallback("TOPIC", func(msg ircmsg.Message) { b.onRDirCDTopic(conn, msg) })
 	return conn
@@ -665,8 +689,8 @@ func (b *Bridge) autoJoinOwners(conn *ircevent.Connection, destination string) {
 	}
 }
 
-func (b *Bridge) onRDirCDMessage(conn *ircevent.Connection, msg ircmsg.Message, notice bool) {
-	if len(msg.Params) < 2 {
+func (b *Bridge) onRDirCDMessage(ctx context.Context, conn *ircevent.Connection, msg ircmsg.Message, notice bool) {
+	if ctx.Err() != nil || len(msg.Params) < 2 {
 		return
 	}
 	target, text := msg.Params[0], msg.Params[1]
@@ -722,14 +746,53 @@ func (b *Bridge) onRDirCDMessage(conn *ircevent.Connection, msg ircmsg.Message, 
 		b.relayToErgo(destination, nick, text, true, discordMessageRef{})
 		return
 	}
+	_, attachment := msg.GetTag("+dickord/attachment")
 	// Legacy fallback supports rollback to an older rdircd image.
-	if isDiscordDeletion(text) && validDiscordID(discordMessageID) {
+	if attachment == "" && isDiscordDeletion(text) && validDiscordID(discordMessageID) {
 		b.relayRedactionWithRetry(destination, 50, target, discordMessageID)
 		return
 	}
-	if reaction, ok := parseDiscordReaction(text); ok {
+	if reaction, ok := parseDiscordReaction(text); attachment == "" && ok {
 		b.relayReactionWithRetry(destination, nick, reaction, text, notice, 50, target, discordMessageID)
 		return
+	}
+	if attachment != "" && validDiscordID(discordMessageID) && destination != control {
+		b.mu.RLock()
+		ergo := b.ergo
+		ready := b.ergoRegistered && b.operReady
+		b.mu.RUnlock()
+		if ergo == nil || !ready {
+			return
+		}
+		support := ergo.ISupport()
+		endpoint := support["FILEHOST"]
+		if endpoint == "" {
+			endpoint = support["draft/FILEHOST"]
+		}
+		if endpoint == "" {
+			endpoint = support["soju.im/FILEHOST"]
+		}
+		if endpoint != "" {
+			uploaded, err := b.uploads.Upload(ctx, endpoint, attachment)
+			if ctx.Err() != nil {
+				return
+			}
+			b.mu.RLock()
+			current := b.ergo == ergo && b.rdircd == conn && b.ergoRegistered && b.operReady
+			b.mu.RUnlock()
+			if !current {
+				return
+			}
+			rnick := relayNick(nick, nickLength(support))
+			limit := min(400-len(rnick)-3, 510-len("RELAYMSG ")-len(destination)-1-len(rnick)-2)
+			if err != nil {
+				b.log.Warn("attachment upload failed; retaining Discord link", "error", err)
+			} else if len(uploaded) > limit {
+				b.log.Warn("uploaded attachment URL exceeds IRC line limit; retaining Discord link")
+			} else {
+				text = uploaded
+			}
+		}
 	}
 	b.relayToErgo(destination, nick, text, notice, discordMessageRef{
 		source: target, messageID: discordMessageID, replyMessageID: discordReplyMessageID,

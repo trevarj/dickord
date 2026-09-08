@@ -1524,7 +1524,7 @@ class IRCProtocol(asyncio.Protocol):
 			data_repr = data_repr[:max_len] + ext.format(data_len=data_len)
 		return (data_len, data_repr) if prefix else data_repr
 
-	def _parse(self, line, _tag_esc='\\:-;-\\s- -\\r-\r-\\n-\n'.split('-')):
+	def _parse(self, line, _tag_esc={':': ';', 's': ' ', 'r': '\r', 'n': '\n'}):
 		if isinstance(line, bytes): line = line.decode()
 		m = adict(line=line, tags=dict(), src=None, params=list())
 
@@ -1535,7 +1535,7 @@ class IRCProtocol(asyncio.Protocol):
 				try:
 					tag, val = tag.split('=', 1)
 					if not val: raise ValueError
-					for a, b in it_batched(_tag_esc, 2): val = val.replace(a, b)
+					val = re.sub(r'\\(.?)', lambda m: _tag_esc.get(m[1], m[1]), val)
 				except ValueError: val = ''
 				m.tags[tag] = val
 			line = line.lstrip(' ')
@@ -1583,22 +1583,29 @@ class IRCProtocol(asyncio.Protocol):
 		dst, line = m.params
 		pre, max_len = f'{m.cmd.upper()} {dst}', self.conf.irc_len_lwm
 		if m.src: pre = f'{m.src} {pre}'
-		if '\n' in line:
-			for line in line.split('\n'): self.send(pre, f':{line.rstrip()}')
-			return
-		subs, lines = list(), list()
-		for m in reversed(list(self.conf._irc_len_dont_split_re.finditer(line))):
-			line = line[:m.start()] + '\uf0ff'*len(m[1]) + line[m.end():]
-			subs.append(m[0]) # to replace back later
-		line, ws = '', re.findall(r'(\S+)(\s*)', line)
-		for w, sep in ws:
-			if line.strip() and len(line) + len(w) > max_len:
-				lines.append(line); line = sep_last
-			sep_last, line = sep, line + w + sep
-		if line.strip(): lines.append(line)
+		if attachment := m.tags.get('+dickord/attachment'):
+			# ponytail: one bounded attachment frame; oversized URLs retain text only.
+			if ( '\n' not in line and len(attachment.encode()) <= 2048
+					and len(m.line.encode()) <= 8190 ):
+				return self.send(m.line, max_len=8190, auto_split=False)
+			m.tags.pop('+dickord/attachment')
+		multiline, subs, lines = '\n' in line, list(), list()
+		if multiline: lines = line.split('\n')
+		else:
+			for match in reversed(list(self.conf._irc_len_dont_split_re.finditer(line))):
+				line = line[:match.start()] + '\uf0ff'*len(match[1]) + line[match.end():]
+				subs.append(match[0]) # to replace back later
+			line, ws = '', re.findall(r'(\S+)(\s*)', line)
+			for w, sep in ws:
+				if line.strip() and len(line) + len(w) > max_len:
+					lines.append(line); line = sep_last
+				sep_last, line = sep, line + w + sep
+			if line.strip(): lines.append(line)
 		for line in lines:
-			line = re.sub(r'\uf0ff+', lambda m: subs.pop(), line.rstrip())
-			self.send(pre, f':{line}', auto_split=False)
+			line = re.sub(r'\uf0ff+', lambda m: subs.pop(), line.rstrip()) if not multiline else line.rstrip()
+			tags = ';'.join(f'{k}={self.tag_escape(v)}' for k, v in m.tags.items())
+			self.send(f'@{tags} {pre}' if tags else pre, f':{line}', auto_split=multiline)
+			m.tags.pop('+dickord/discord-reply-msgid', None)
 
 	async def recv_queue_proc(self):
 		try:
@@ -1957,7 +1964,7 @@ class IRCProtocol(asyncio.Protocol):
 
 	def dickord_tags( self, discord_msg_id=None, discord_user_id=None,
 			discord_reply_msg_id=None, discord_self=False, discord_event=None, discord_emoji=None,
-			discord_emoji_api=None, discord_burst=False ):
+			discord_emoji_api=None, discord_burst=False, discord_attachment=None ):
 		tags = list()
 		for tag, value in [
 				('+dickord/discord-msgid', discord_msg_id),
@@ -1967,7 +1974,8 @@ class IRCProtocol(asyncio.Protocol):
 			elif value: self.log.warning('Ignoring invalid Discord snowflake tag {}={!r}', tag, value)
 		for tag, value in [
 				('+dickord/event', discord_event), ('+dickord/emoji', discord_emoji),
-				('+dickord/discord-emoji', discord_emoji_api) ]:
+				('+dickord/discord-emoji', discord_emoji_api),
+				('+dickord/attachment', discord_attachment) ]:
 			if value: tags.append(f'{tag}={self.tag_escape(value)}')
 		if discord_self: tags.append('+dickord/self=1')
 		if discord_burst: tags.append('+dickord/burst=1')
@@ -1977,7 +1985,7 @@ class IRCProtocol(asyncio.Protocol):
 			discord_msg_id=None, discord_user_id=None, discord_reply_msg_id=None,
 			discord_self=False,
 			discord_event=None, discord_emoji=None, discord_emoji_api=None,
-			discord_burst=False ):
+			discord_burst=False, discord_attachment=None ):
 		'''Send message to channel that this IRC client is connected to.
 			Message is never filtered/dropped here for reliability/sanity reasons.'''
 		msg_type = 'PRIVMSG' if not notice else 'NOTICE'
@@ -1990,7 +1998,8 @@ class IRCProtocol(asyncio.Protocol):
 			self.send(f':{self.src_discord(nick)} JOIN {chan}')
 		tags = self.dickord_tags(
 			discord_msg_id, discord_user_id, discord_reply_msg_id,
-			discord_self, discord_event, discord_emoji, discord_emoji_api, discord_burst )
+			discord_self, discord_event, discord_emoji, discord_emoji_api,
+			discord_burst, discord_attachment )
 		self.send(f'{tags}:{self.src_discord(nick)} {msg_type} {chan} :{text}')
 		self.st_irc.typing_repeat.active.pop((nick, chan), None)
 
@@ -3880,6 +3889,7 @@ class DiscordSession:
 		# "line" here can be multiline, and have attachments/stickers/buttons and such
 		# Link/media info ("embeds") is parsed/cached/added to it separately, if enabled
 		line, tags = self.op_msg_parse(m, gg, is_update=msg_is_update, can_be_empty=media_info)
+		media_attachments = media_tags.pop('_attachments', {})
 		tags.update(media_tags)
 
 		media_expected = tags.pop('_embed_info', False)
@@ -3910,6 +3920,10 @@ class DiscordSession:
 						elif ( line and re.match(self.conf.discord_embed_cdn_re, line)
 							and line in el ): line = '' # embed-url = content-url + ?ex=...
 				el, es = self.conf.discord_embed_info_len, self.conf._discord_embed_info_len_skip_re
+				for att_line, att_url in media_attachments.items():
+					if att_line in media_info:
+						if not es.search(att_line): att_line = str_cut(att_line, el)
+						tags.setdefault('_attachments', {})[att_line] = att_url
 				line = '\n'.join([line, *(( str_cut(line, el)
 					if not es.search(line) else line ) for line in media_info)]).strip()
 				if not (line or any(media_info)): return # deliberately parsed to empty line(s)
@@ -4087,6 +4101,8 @@ class DiscordSession:
 			if not (msg := msg_ref.get('message')): continue
 			msg.id = msg_id # op_msg_parse might want to use that
 			msg_line, msg_tags = self.op_msg_parse(msg, gg, can_be_empty=True)
+			if attachments := msg_tags.pop('_attachments', None):
+				res.tags.setdefault('_attachments', {}).update(attachments)
 			res.tags.update(msg_tags)
 			if msg_line: res.lines.extend(msg_line.split('\n'))
 			if lines := self.op_msg_media_info(msg): res.media.extend(lines)
@@ -4154,11 +4170,13 @@ class DiscordSession:
 			if not (url := att.get('url')):
 				self.log.warning('Unhandled msg attachment type: {}', self._repr(att))
 				continue
+			raw_url = url
 			if ( self.conf.discord_terminal_links and
 					(ma := self.conf._discord_terminal_links_re.search(url)) ):
 				name = ma['name']
 				if mh := ma.groupdict().get('hash'): name += f' {str_hash(mh, 4)}'
 				url = self.conf.discord_terminal_links_tpl.format(url=url, name=name)
+			tags.setdefault('_attachments', {})[f'{self.conf.irc_prefix_attachment}{url}'.strip()] = raw_url
 			line += f'\n{self.conf.irc_prefix_attachment}{url}'
 
 		for stk in m.get('stickers') or m.get('sticker_items') or list():
@@ -5583,7 +5601,10 @@ class RDIRCD:
 			if not conns_joined and not self.cmd_conn(): return # no irc clients
 
 		prefix_tag = prefix = ''
+		attachments = {}
 		if tags:
+			tags = tags.copy() # history records can be replayed to more than one client
+			attachments = tags.pop('_attachments', {})
 			prefix_tag = prefix = tags.pop('_prefix', prefix)
 			if ev := tags.pop('_ev', None): prefix += self.conf.irc_prefix_event
 			for k, (tt, v) in tags.items():
@@ -5608,20 +5629,30 @@ class RDIRCD:
 		if self.cmd_msg_recv_filter(nick, prefix_mon + line): return
 		lines = self.cmd_msg_discord_lines( line,
 			dedup=prefix_tag, dedup_key=msg_id and (msg_id, name, nick, notice) )
+		attachment_lines = {}
+		for att_line, att_url in attachments.items():
+			# Generated attachment lines follow the body; consume only the last match.
+			for n in reversed(range(len(lines))):
+				if lines[n].endswith(att_line):
+					attachment_lines[n] = att_url
+					break
 
 		# Relay message to direct-proxy IRC channel
 		if not skip_chan:
-			chan_lines = self.cmd_msg_recv_lines_proc(cc.gg, (f'{prefix}{ln}' for ln in lines))
+			chan_lines = [
+				(ln, attachment_lines.get(n)) for n, line in enumerate(lines)
+				for ln in self.cmd_msg_recv_lines_proc(cc.gg, [f'{prefix}{line}']) ]
 			joined = not cc.users.check_bump(nick_discord)
 			cc.users[nick_discord] = nick
-			for conn, (n, ln) in it.product(conns_joined, enumerate(chan_lines)):
+			for conn, (n, (ln, attachment)) in it.product(conns_joined, enumerate(chan_lines)):
 				conn.cmd_msg_chan( nick, name, ln, notice=notice, joined=joined and not n,
 					discord_msg_id=discord_msg_id or msg_id,
 					discord_user_id=discord_user_id,
 					discord_reply_msg_id=discord_reply_msg_id if not n else None,
 					discord_self=discord_self,
 					discord_event=discord_event, discord_emoji=discord_emoji,
-					discord_emoji_api=discord_emoji_api, discord_burst=discord_burst )
+					discord_emoji_api=discord_emoji_api, discord_burst=discord_burst,
+					discord_attachment=attachment )
 
 		# Relay message to all relevant monitor/leftover channels
 		if skip_monitor: return

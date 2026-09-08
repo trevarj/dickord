@@ -21,6 +21,7 @@ records the pinned upstream commit.
 - Owner-only IRC-to-Discord messages and actions
 - Native IRCv3 reactions and message redactions in both directions
 - Native Motd-to-Discord replies and optional typing notifications
+- Discord photo, video, and file attachments rehosted through Ergo's FILEHOST
 
 ## Requirements
 
@@ -104,6 +105,39 @@ replies. Correlation is kept in a bounded 4,096-message in-memory cache; after a
 restart or cache eviction, the same action safely sends a normal message instead.
 Long messages are split as before, with only the first Discord chunk attached
 to the reply.
+
+## Attachments
+
+Dickord discovers the HTTPS upload service advertised by Ergo's `FILEHOST`,
+`draft/FILEHOST`, or `soju.im/FILEHOST` ISUPPORT token. It reuploads actual Discord
+attachments and relays the returned URL as plain text, preserving `/discord`
+attribution, message order, replies, and redactions. Clients that preview image
+and video URLs can then display the hosted media. Pasted links are not uploaded.
+
+Ergo advertises the service; it does not provide HTTP file storage itself.
+Configure a compatible [FILEHOST service](https://codeberg.org/emersion/soju/src/branch/master/doc/ext/filehost.md)
+and advertise its upload endpoint in Ergo's `ircd.yaml`:
+
+```yaml
+server:
+  additional-isupport:
+    "soju.im/FILEHOST": "https://files.example.com/upload"
+```
+
+No new Dickord JSON fields, secret mounts, or Compose services are required.
+Uploads use the bridge's existing Ergo account and SASL password as HTTP Basic
+credentials, so advertise only a service you trust with those credentials.
+The endpoint must use HTTPS with a valid hostname certificate; HTTPS uploads
+use `ergo.ca_file` when configured, otherwise system trust roots. Discord CDN
+downloads always use system trust roots and never receive IRC credentials.
+Neither downloads nor uploads follow redirects.
+
+Attachments stream without local storage, with a 100 MiB limit and a 60-second
+download/upload deadline. Unknown sizes, expired Discord URLs, rejected uploads,
+or absent FILEHOST support fall back to the existing Discord-link rendering.
+Catch-up uses the same path; replaying an attachment can upload another copy.
+Hosted file access and retention belong to the filehost: redacting an IRC
+message does not delete the uploaded file.
 
 ## Security model
 

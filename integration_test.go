@@ -17,6 +17,8 @@ import (
 	"log/slog"
 	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,8 +61,69 @@ func TestErgoIntegration(t *testing.T) {
 		t.Skip("docker unavailable")
 	}
 
+	const cdnBase = "https://cdn.discordapp.com/attachments/100/200/"
+	photoSource := cdnBase + "photo.png?ex=abcdef&hm=" + strings.Repeat("a", 600)
+	videoSource := cdnBase + "clip.mp4"
+	failedSource := cdnBase + "rejected.png"
+	attachments := []struct{ source, body, contentType, location string }{
+		{photoSource, "\x89PNG\r\n\x1a\nphoto\x00payload", "image/png", "files/photo.png"},
+		{videoSource, "\x00\x00\x00\x18ftypmp42\x00video payload", "video/mp4", "files/clip.mp4"},
+		{failedSource, "rejected attachment bytes", "image/png", ""},
+	}
+	httpRequests := make(chan string, 16)
+	releasePhoto := make(chan struct{})
+	filehost := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpRequests <- r.Method + " " + r.URL.RequestURI()
+		var body []byte
+		if r.Method == http.MethodPost {
+			user, password, ok := r.BasicAuth()
+			if !ok || user != "Dickord" || password != "bridgepass" {
+				t.Errorf("FILEHOST authentication: user=%q authenticated=%v", user, ok)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			var err error
+			body, err = io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("reading FILEHOST upload: %v", err)
+				http.Error(w, "read failed", http.StatusBadRequest)
+				return
+			}
+		}
+		for _, attachment := range attachments {
+			if r.Method == http.MethodGet && r.Host == "cdn.discordapp.com" && r.URL.RequestURI() == strings.TrimPrefix(attachment.source, "https://cdn.discordapp.com") {
+				if r.Header.Get("Authorization") != "" {
+					t.Error("FILEHOST credentials leaked to Discord CDN")
+				}
+				if attachment.source == photoSource {
+					select {
+					case <-releasePhoto:
+					case <-r.Context().Done():
+						return
+					}
+				}
+				w.Header().Set("Content-Type", attachment.contentType)
+				w.Header().Set("Content-Length", fmt.Sprint(len(attachment.body)))
+				_, _ = io.WriteString(w, attachment.body)
+				return
+			}
+			if r.Method == http.MethodPost && r.URL.Path == "/filehost/" && string(body) == attachment.body {
+				if attachment.location == "" {
+					http.Error(w, "upload rejected", http.StatusForbidden)
+				} else {
+					w.Header().Set("Location", attachment.location)
+					w.WriteHeader(http.StatusCreated)
+				}
+				return
+			}
+		}
+		t.Errorf("unexpected attachment HTTP request: %s %s body=%q", r.Method, r.URL, body)
+		http.Error(w, "unexpected request", http.StatusBadRequest)
+	}))
+	defer filehost.Close()
+
 	temp := t.TempDir()
-	certPool, port := startTestErgo(t, temp)
+	certPool, port := startTestErgo(t, temp, filehost.URL+"/filehost/")
 	registerTestAccount(t, port, certPool, "Dickord", "bridgepass")
 	registerTestAccount(t, port, certPool, "owner", "ownerpass")
 	registerTestAccount(t, port, certPool, "mallory", "mallorypass")
@@ -96,6 +159,17 @@ func TestErgoIntegration(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	ctx, cancel := context.WithCancel(context.Background())
 	bridge := newBridge(cfg, logger)
+	downloadTransport := filehost.Client().Transport.(*http.Transport).Clone()
+	downloadTransport.TLSClientConfig.ServerName = filehost.Certificate().DNSNames[0]
+	downloadTransport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if address != "cdn.discordapp.com:443" {
+			return nil, fmt.Errorf("unexpected CDN address %q", address)
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, filehost.Listener.Addr().String())
+	}
+	defer downloadTransport.CloseIdleConnections()
+	bridge.uploads.downloadClient.Transport = downloadTransport
+	bridge.uploads.uploadClient.Transport = filehost.Client().Transport
 	bridgeDone := make(chan error, 1)
 	go func() { bridgeDone <- bridge.Run(ctx) }()
 	defer func() {
@@ -150,6 +224,95 @@ func TestErgoIntegration(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Discord-to-Ergo relay timed out")
+	}
+
+	expectDiscord := func(text string) ircmsg.Message {
+		t.Helper()
+		select {
+		case msg := <-ownerMessages:
+			if msg.Command != "PRIVMSG" || msg.Nick() != "Alice/discord" || len(msg.Params) < 2 || msg.Params[1] != text {
+				t.Fatalf("relayed message=%+v, want Alice/discord PRIVMSG %q", msg, text)
+			}
+			if _, id := msg.GetTag("msgid"); id == "" {
+				t.Fatal("attachment scenario relay has no Ergo msgid")
+			}
+			return msg
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Discord relay timed out waiting for %q", text)
+			return ircmsg.Message{}
+		}
+	}
+	const photoDiscordID = "900000000000000001"
+	const videoDiscordID = "900000000000000002"
+	fake.SendDiscordID(photoDiscordID, "photo caption")
+	fake.send("@+dickord/discord-msgid=" + photoDiscordID + ";+dickord/discord-userid=" + testDiscordUserID + ";+dickord/attachment=" + photoSource + " :Alice!Alice@discord PRIVMSG #me.chat.alice :[att] " + photoSource)
+	fake.SendDiscordID("900000000000000003", "after photo")
+	fake.send("@+dickord/discord-msgid=" + videoDiscordID + ";+dickord/discord-userid=" + testDiscordUserID + ";+dickord/discord-reply-msgid=" + testDiscordMessageID + ";+dickord/attachment=" + videoSource + " :Alice!Alice@discord PRIVMSG #me.chat.alice :[att] " + videoSource)
+	fake.SendDiscordID("900000000000000004", "after video")
+	caption := expectDiscord("photo caption")
+	_, captionErgoID := caption.GetTag("msgid")
+	if got, want := waitText(t, httpRequests, "signed photo download"), "GET "+strings.TrimPrefix(photoSource, "https://cdn.discordapp.com"); got != want {
+		t.Fatalf("signed photo request=%q, want %q", got, want)
+	}
+	select {
+	case msg := <-ownerMessages:
+		t.Fatalf("message overtook pending attachment download: %+v", msg)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releasePhoto)
+	photo := expectDiscord(filehost.URL + "/filehost/files/photo.png")
+	_, photoErgoID := photo.GetTag("msgid")
+	expectDiscord("after photo")
+	video := expectDiscord(filehost.URL + "/filehost/files/clip.mp4")
+	_, videoErgoID := video.GetTag("msgid")
+	if _, reply := video.GetTag("+reply"); reply != ircMessageID {
+		t.Fatalf("uploaded video lost native reply: got %q, want %q", reply, ircMessageID)
+	}
+	expectDiscord("after video")
+	for _, want := range []string{"POST /filehost/", "GET /attachments/100/200/clip.mp4", "POST /filehost/"} {
+		if got := waitText(t, httpRequests, "attachment HTTP request"); got != want {
+			t.Fatalf("attachment request=%q, want %q", got, want)
+		}
+	}
+
+	fake.SendDiscordReply("900000000000000005", videoDiscordID, "reply to uploaded video")
+	videoReply := expectDiscord("reply to uploaded video")
+	if _, reply := videoReply.GetTag("+reply"); reply != videoErgoID {
+		t.Fatalf("reply to uploaded video=%q, want %q", reply, videoErgoID)
+	}
+	if err := owner.SendWithTags(map[string]string{"+reply": videoErgoID}, "PRIVMSG", "#discord.me.chat.alice", "native attachment reply"); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitOutbound(t, fake.outbound, "mapped attachment reply"); got.text != "native attachment reply" || got.tags["+dickord/discord-reply-msgid"] != videoDiscordID {
+		t.Fatalf("mapped attachment reply=%+v", got)
+	}
+	fake.SendDelete(photoDiscordID)
+	photoMessageIDs := map[string]bool{captionErgoID: true, photoErgoID: true}
+	for range 2 {
+		select {
+		case msg := <-ownerMessages:
+			if msg.Command != "REDACT" || len(msg.Params) < 2 || !photoMessageIDs[msg.Params[1]] {
+				t.Fatalf("unexpected caption/attachment redaction: %+v", msg)
+			}
+			delete(photoMessageIDs, msg.Params[1])
+		case <-time.After(3 * time.Second):
+			t.Fatal("caption/attachment redaction timed out")
+		}
+	}
+
+	fake.send("@+dickord/discord-msgid=900000000000000006;+dickord/discord-userid=" + testDiscordUserID + ";+dickord/attachment=" + failedSource + " :Alice!Alice@discord PRIVMSG #me.chat.alice :[att] " + failedSource)
+	expectDiscord("[att] " + failedSource)
+	for _, want := range []string{"GET /attachments/100/200/rejected.png", "POST /filehost/"} {
+		if got := waitText(t, httpRequests, "rejected attachment HTTP request"); got != want {
+			t.Fatalf("rejected attachment request=%q, want %q", got, want)
+		}
+	}
+	fake.SendDiscordID("900000000000000007", videoSource)
+	expectDiscord(videoSource)
+	select {
+	case request := <-httpRequests:
+		t.Fatalf("untagged pasted URL caused attachment HTTP request: %q", request)
+	case <-time.After(200 * time.Millisecond):
 	}
 
 	fake.SendDiscordReply(testReplyDiscordID, testDiscordMessageID, "Discord native reply")
@@ -522,7 +685,7 @@ func TestErgoIntegration(t *testing.T) {
 	waitSignal(t, fake.accepted, "rdircd reconnect after Ergo recovery")
 }
 
-func startTestErgo(t *testing.T, dir string) (*x509.CertPool, int) {
+func startTestErgo(t *testing.T, dir, filehostURL string) (*x509.CertPool, int) {
 	t.Helper()
 	port := freePort(t)
 	certPEM, keyPEM := testCertificate(t)
@@ -533,6 +696,8 @@ network:
     name: DickordTest
 server:
     name: ergo.test
+    additional-isupport:
+        "soju.im/FILEHOST": %q
     listeners:
         ":%d":
             tls:
@@ -624,7 +789,7 @@ logging:
         method: stderr
         type: "* -userinput -useroutput"
         level: info
-`, port, integrationOperHash)
+`, filehostURL, port, integrationOperHash)
 	writeTestFile(t, filepath.Join(dir, "ircd.yaml"), []byte(config), 0o600)
 
 	name := testErgoName(t)
