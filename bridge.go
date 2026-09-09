@@ -1427,29 +1427,34 @@ func (b *Bridge) onErgoMessage(conn *ircevent.Connection, msg ircmsg.Message) {
 	_, ergoMsgID := msg.GetTag("msgid")
 	voiceDurationPresent, voiceDuration := msg.GetTag("+dickord/voice-duration")
 	voiceWaveformPresent, voiceWaveform := msg.GetTag("+dickord/voice-waveform")
-	if voiceDurationPresent || voiceWaveformPresent {
+	voiceRequested := voiceDurationPresent || voiceWaveformPresent
+	uploadURL, urlErr := attachmentHTTPSURL(text)
+	support := conn.ISupport()
+	endpoint := support["FILEHOST"]
+	if endpoint == "" {
+		endpoint = support["draft/FILEHOST"]
+	}
+	if endpoint == "" {
+		endpoint = support["soju.im/FILEHOST"]
+	}
+	filehostURL, endpointErr := attachmentHTTPSURL(endpoint)
+	uploadRequested := len(text) <= maxAttachmentURLLength && urlErr == nil && endpointErr == nil &&
+		sameHTTPSOrigin(uploadURL, filehostURL)
+	if voiceRequested {
 		duration, err := strconv.ParseFloat(voiceDuration, 64)
 		waveform, waveformErr := base64.StdEncoding.Strict().DecodeString(voiceWaveform)
-		voiceURL, urlErr := attachmentHTTPSURL(text)
-		support := conn.ISupport()
-		endpoint := support["FILEHOST"]
-		if endpoint == "" {
-			endpoint = support["draft/FILEHOST"]
-		}
-		if endpoint == "" {
-			endpoint = support["soju.im/FILEHOST"]
-		}
-		filehostURL, endpointErr := attachmentHTTPSURL(endpoint)
 		if !voiceDurationPresent || !voiceWaveformPresent || err != nil || duration <= 0 ||
 			math.IsNaN(duration) || math.IsInf(duration, 0) || waveformErr != nil ||
-			len(waveform) == 0 || len(waveform) > 256 || len(text) > maxAttachmentURLLength ||
-			urlErr != nil || endpointErr != nil || !sameHTTPSOrigin(voiceURL, filehostURL) {
+			len(waveform) == 0 || len(waveform) > 256 || !uploadRequested {
 			b.notifyErgo(destination, "Invalid voice message; expected a FILEHOST URL, positive duration, and 1-256 waveform bytes")
 			return
 		}
-		tags := map[string]string{
-			"+dickord/voice-duration": voiceDuration,
-			"+dickord/voice-waveform": voiceWaveform,
+	}
+	if uploadRequested {
+		tags := map[string]string{"+dickord/upload": "1"}
+		if voiceRequested {
+			tags["+dickord/voice-duration"] = voiceDuration
+			tags["+dickord/voice-waveform"] = voiceWaveform
 		}
 		if ergoMsgID != "" {
 			tags["+dickord/ergo-msgid"] = ergoMsgID
@@ -1457,8 +1462,8 @@ func (b *Bridge) onErgoMessage(conn *ircevent.Connection, msg ircmsg.Message) {
 		if discordReplyID != "" {
 			tags["+dickord/discord-reply-msgid"] = discordReplyID
 		}
-		if err := rdircd.SendWithTags(tags, "PRIVMSG", source, voiceURL.String()); err != nil {
-			b.notifyErgo(destination, "Discord bridge unavailable; voice message not sent")
+		if err := rdircd.SendWithTags(tags, "PRIVMSG", source, uploadURL.String()); err != nil {
+			b.notifyErgo(destination, "Discord bridge unavailable; media not sent")
 		}
 		return
 	}

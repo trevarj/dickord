@@ -22,7 +22,7 @@ records the pinned upstream commit.
 - Native IRCv3 reactions and message redactions in both directions
 - Native Motd-to-Discord replies and optional typing notifications
 - Discord photo, video, and file attachments rehosted through Ergo's FILEHOST
-- Explicit FILEHOST-to-Discord Ogg Opus voice messages
+- FILEHOST uploads sent as Discord attachments and Ogg Opus voice messages
 
 ## Requirements
 
@@ -115,6 +115,11 @@ attachments and relays the returned URL as plain text, preserving `/discord`
 attribution, message order, replies, and redactions. Clients that preview image
 and video URLs can then display the hosted media. Pasted links are not uploaded.
 
+In the other direction, an authorized message consisting only of a URL on the
+advertised FILEHOST origin is downloaded and uploaded to Discord as an
+attachment. Discord then serves it from its media CDN. URLs on other origins
+remain ordinary text.
+
 Ergo advertises the service; it does not provide HTTP file storage itself.
 Configure a compatible [FILEHOST service](https://codeberg.org/emersion/soju/src/branch/master/doc/ext/filehost.md)
 and advertise its upload endpoint in Ergo's `ircd.yaml`:
@@ -142,20 +147,19 @@ message does not delete the uploaded file.
 
 ## Voice messages
 
-Discord voice messages require an Ogg Opus file, its duration, and a waveform;
-IRC has no standard voice-message attachment. Upload the recording to the
-FILEHOST advertised by Ergo, then send its URL with Dickord's client-only tags:
+Upload an Ogg Opus recording through the IRC client's normal FILEHOST flow and
+send the returned URL. When FILEHOST serves it as `audio/ogg`, Dickord derives
+its duration from the Ogg stream and sends it using Discord's native voice
+message flag. No custom IRC command or tag is required.
 
-```irc
-@+dickord/voice-duration=2.5;+dickord/voice-waveform=AAE= PRIVMSG #discord.example :https://files.example.com/voice-message.ogg
-```
+Dickord uses a minimal flat waveform because IRC FILEHOST does not provide
+decoded audio samples. A recorder integration can override the duration and
+waveform with `+dickord/voice-duration` and `+dickord/voice-waveform` client
+tags; waveform values are standard base64 encoding of 1–256 amplitude bytes.
 
-The waveform is standard base64 encoding of 1–256 amplitude bytes. Dickord
-accepts the request only from an authorized owner and only when the HTTPS URL
-has the advertised FILEHOST origin. The source must be a known-size
-`audio/ogg` Ogg Opus file no larger than 25 MiB; downloads do not follow
-redirects or receive Discord credentials. An untagged audio URL remains an
-ordinary text message.
+Outbound Discord uploads must have a known size no larger than 25 MiB.
+Downloads do not follow redirects or receive Discord credentials. Malformed
+Ogg audio fails closed instead of becoming a generic attachment.
 
 ## Security model
 

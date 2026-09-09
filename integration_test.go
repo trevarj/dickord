@@ -588,11 +588,11 @@ func TestErgoIntegration(t *testing.T) {
 		"+dickord/voice-duration": "2.5",
 		"+dickord/voice-waveform": "AAE=",
 	}
-	if err := owner.SendWithTags(voiceTags, "PRIVMSG", "#discord.me.chat.alice", voiceURL); err != nil {
+	if err := owner.Privmsg("#discord.me.chat.alice", voiceURL); err != nil {
 		t.Fatal(err)
 	}
-	if got := waitOutbound(t, fake.outbound, "voice message relay"); got.text != voiceURL ||
-		got.tags["+dickord/voice-duration"] != "2.5" || got.tags["+dickord/voice-waveform"] != "AAE=" {
+	if got := waitOutbound(t, fake.outbound, "FILEHOST upload relay"); got.text != voiceURL ||
+		got.tags["+dickord/upload"] != "1" {
 		t.Fatalf("voice outbound=%+v", got)
 	}
 
