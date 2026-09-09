@@ -166,6 +166,52 @@ func TestReactionTags(t *testing.T) {
 	}
 }
 
+func TestRDirCDChannelMetadataRequiresMappingAndCapability(t *testing.T) {
+	rdircd := &ircevent.Connection{}
+	message := ircmsg.MakeMessage(
+		map[string]string{"+dickord/channel": `{"v":1}`},
+		"core!u@rdircd", "TAGMSG", "#source",
+	)
+
+	t.Run("unmapped", func(t *testing.T) {
+		bridge := &Bridge{
+			rdircd:         rdircd,
+			ergo:           &ircevent.Connection{},
+			ergoRegistered: true,
+			operReady:      true,
+			sourceToDest:   make(map[string]string),
+		}
+		bridge.onRDirCDTagMessage(rdircd, message)
+		if len(bridge.sourceToDest) != 0 {
+			t.Fatalf("metadata synthesized a mapping: %v", bridge.sourceToDest)
+		}
+	})
+
+	t.Run("no metadata capability", func(t *testing.T) {
+		ergo := &ircevent.Connection{}
+		bridge := &Bridge{
+			cfg:            RuntimeConfig{Config: Config{Channels: ChannelConfig{CatchUpLimit: 1}}},
+			rdircd:         rdircd,
+			ergo:           ergo,
+			ergoRegistered: true,
+			operReady:      true,
+			sourceToDest:   map[string]string{"#source": "#destination"},
+			discordRefs:    make(map[string]discordMessageRef),
+			ergoByDiscord:  make(map[discordRefKey][]string),
+		}
+		message := ircmsg.MakeMessage(map[string]string{
+			"+dickord/channel":       `{"v":1}`,
+			"+dickord/guild-icon":    "https://example.test/icon.png",
+			"+dickord/discord-msgid": "123456789012345678",
+			"+reply":                 "ergo-message",
+		}, "core!u@rdircd", "TAGMSG", "#source")
+		bridge.onRDirCDTagMessage(rdircd, message)
+		if ref := bridge.discordRefs["ergo-message"]; ref.source != "#source" || ref.messageID != "123456789012345678" {
+			t.Fatalf("non-metadata TAGMSG handling broke without the capability: %+v", ref)
+		}
+	})
+}
+
 func TestRelayAddressTranslation(t *testing.T) {
 	bridge := &Bridge{discordUsers: map[discordUserKey]string{
 		{source: "#one", nick: "crispy"}: "123456789012345678",

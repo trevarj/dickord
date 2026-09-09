@@ -166,7 +166,7 @@ func (b *Bridge) newErgoConnection() *ircevent.Connection {
 		TLSConfig:       &tls.Config{MinVersion: tls.VersionTLS12, ServerName: b.cfg.Ergo.TLSServerName, RootCAs: b.cfg.ErgoRootCAs},
 		SASLLogin:       b.cfg.Ergo.Account,
 		SASLPassword:    b.cfg.ErgoPassword,
-		RequestCaps:     []string{"account-notify", "account-tag", "echo-message", "extended-join", "server-time", "message-tags", "batch", "labeled-response", "draft/message-redaction", "draft/relaymsg"},
+		RequestCaps:     []string{"account-notify", "account-tag", "echo-message", "extended-join", "server-time", "message-tags", "batch", "labeled-response", "draft/message-redaction", "draft/metadata-2", "draft/relaymsg"},
 		Timeout:         20 * time.Second,
 		KeepAlive:       90 * time.Second,
 		ReconnectFreq:   b.cfg.Reconnect.Minimum,
@@ -556,6 +556,13 @@ func (b *Bridge) onRDirCDTagMessage(conn *ircevent.Connection, msg ircmsg.Messag
 	if len(msg.Params) < 1 {
 		return
 	}
+	source := msg.Params[0]
+	if present, channel := msg.GetTag("+dickord/channel"); present {
+		b.setErgoChannelMetadata(conn, source, "dickord/channel", channel)
+	}
+	if present, avatar := msg.GetTag("+dickord/guild-icon"); present {
+		b.setErgoChannelMetadata(conn, source, "avatar", avatar)
+	}
 	_, discordMsgID := msg.GetTag("+dickord/discord-msgid")
 	_, ergoMsgID := msg.GetTag("+reply")
 	if discordMsgID == "" || ergoMsgID == "" {
@@ -563,9 +570,31 @@ func (b *Bridge) onRDirCDTagMessage(conn *ircevent.Connection, msg ircmsg.Messag
 	}
 	b.mu.Lock()
 	if b.rdircd == conn {
-		b.cacheDiscordRefLocked(ergoMsgID, discordMessageRef{source: msg.Params[0], messageID: discordMsgID})
+		b.cacheDiscordRefLocked(ergoMsgID, discordMessageRef{source: source, messageID: discordMsgID})
 	}
 	b.mu.Unlock()
+}
+
+func (b *Bridge) setErgoChannelMetadata(rdircd *ircevent.Connection, source, key, value string) {
+	b.mu.RLock()
+	ergo := b.ergo
+	destination := b.sourceToDest[ircCasefold(source)]
+	current := b.rdircd == rdircd
+	ready := b.ergoRegistered && b.operReady
+	b.mu.RUnlock()
+	if !current || ergo == nil || destination == "" || !ready {
+		return
+	}
+	if _, acknowledged := ergo.AcknowledgedCaps()["draft/metadata-2"]; !acknowledged {
+		return
+	}
+	params := []string{destination, "SET", key}
+	if value != "" {
+		params = append(params, value)
+	}
+	if err := ergo.Send("METADATA", params...); err != nil {
+		b.log.Warn("failed to mirror channel metadata", "channel", destination, "key", key, "error", err)
+	}
 }
 
 func (b *Bridge) discordRefLimitLocked() int {
@@ -725,6 +754,7 @@ func (b *Bridge) onRDirCDMessage(ctx context.Context, conn *ircevent.Connection,
 	_, event := msg.GetTag("+dickord/event")
 	_, discordMessageID := msg.GetTag("+dickord/discord-msgid")
 	_, discordReplyMessageID := msg.GetTag("+dickord/discord-reply-msgid")
+	avatarPresent, avatar := msg.GetTag("+dickord/avatar")
 	if !validDiscordID(discordReplyMessageID) {
 		discordReplyMessageID = ""
 	}
@@ -745,7 +775,7 @@ func (b *Bridge) onRDirCDMessage(ctx context.Context, conn *ircevent.Connection,
 		return
 	case "react-remove-all", "react-remove-emoji":
 		// IRC has no native equivalent; preserve these explicit state changes as notices.
-		b.relayToErgo(destination, nick, text, true, discordMessageRef{})
+		b.relayToErgo(destination, nick, text, true, discordMessageRef{}, "", false)
 		return
 	}
 	_, attachment := msg.GetTag("+dickord/attachment")
@@ -798,7 +828,7 @@ func (b *Bridge) onRDirCDMessage(ctx context.Context, conn *ircevent.Connection,
 	}
 	b.relayToErgo(destination, nick, text, notice, discordMessageRef{
 		source: target, messageID: discordMessageID, replyMessageID: discordReplyMessageID,
-	})
+	}, avatar, avatarPresent)
 }
 
 func validDiscordID(value string) bool {
@@ -841,7 +871,7 @@ func (b *Bridge) relayReactionWithRetry(destination, nick string, reaction disco
 	})
 }
 
-func (b *Bridge) relayToErgo(destination, nick, text string, notice bool, discord discordMessageRef) {
+func (b *Bridge) relayToErgo(destination, nick, text string, notice bool, discord discordMessageRef, avatar string, avatarPresent bool) {
 	b.mu.RLock()
 	conn := b.ergo
 	ready := b.ergoRegistered && b.operReady
@@ -872,6 +902,9 @@ func (b *Bridge) relayToErgo(destination, nick, text string, notice bool, discor
 			tags := map[string]string{"+dickord/nonce": nonce}
 			if index == 0 && replyMsgID != "" {
 				tags["+reply"] = replyMsgID
+			}
+			if avatarPresent {
+				tags["+dickord/avatar"] = avatar
 			}
 			if labeled {
 				err := conn.SendWithLabel(func(response *ircevent.Batch) {
@@ -1428,7 +1461,13 @@ func (b *Bridge) onErgoMessage(conn *ircevent.Connection, msg ircmsg.Message) {
 	voiceDurationPresent, voiceDuration := msg.GetTag("+dickord/voice-duration")
 	voiceWaveformPresent, voiceWaveform := msg.GetTag("+dickord/voice-waveform")
 	voiceRequested := voiceDurationPresent || voiceWaveformPresent
-	uploadURL, urlErr := attachmentHTTPSURL(text)
+	uploadText := text
+	if present, version := msg.GetTag("+trevarj.github.io/audio"); !present || version == "1" {
+		if voiceURL, ok := motdVoiceUploadURL(text); ok {
+			uploadText = voiceURL
+		}
+	}
+	uploadURL, urlErr := attachmentHTTPSURL(uploadText)
 	support := conn.ISupport()
 	endpoint := support["FILEHOST"]
 	if endpoint == "" {
@@ -1438,7 +1477,7 @@ func (b *Bridge) onErgoMessage(conn *ircevent.Connection, msg ircmsg.Message) {
 		endpoint = support["soju.im/FILEHOST"]
 	}
 	filehostURL, endpointErr := attachmentHTTPSURL(endpoint)
-	uploadRequested := len(text) <= maxAttachmentURLLength && urlErr == nil && endpointErr == nil &&
+	uploadRequested := len(uploadText) <= maxAttachmentURLLength && urlErr == nil && endpointErr == nil &&
 		sameHTTPSOrigin(uploadURL, filehostURL)
 	if voiceRequested {
 		duration, err := strconv.ParseFloat(voiceDuration, 64)

@@ -449,6 +449,36 @@ func TestAttachmentUploadCancellation(t *testing.T) {
 	}
 }
 
+func TestMotdVoiceUploadURL(t *testing.T) {
+	const clean = "https://files.example/voice.ogg"
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{"clear", "[voice 0:03 audio/ogg] " + clean, clean},
+		{"waveform", "[voice 1:02 audio/ogg] " + clean + "#motd-wave=AQI", clean},
+		{"expiry", "[voice 1:02:03 audio/mp4 expires=2026-08-28T12:00:00Z] " + clean, clean},
+		{"encrypted", "[voice encrypted 0:03 audio/ogg] " + clean + "#motd-key=AQI", ""},
+		{"key", "[voice 0:03 audio/ogg] " + clean + "#motd-key=AQI", ""},
+		{"mixed fragment", "[voice 0:03 audio/ogg] " + clean + "#motd-wave=AQI&motd-key=AQI", ""},
+		{"unknown fragment", "[voice 0:03 audio/ogg] " + clean + "#other=AQI", ""},
+		{"padded waveform", "[voice 0:03 audio/ogg] " + clean + "#motd-wave=AQI=", ""},
+		{"invalid duration", "[voice 0:60 audio/ogg] " + clean, ""},
+		{"invalid media", "[voice 0:03 text/plain] " + clean, ""},
+		{"invalid expiry", "[voice 0:03 audio/ogg expires=tomorrow] " + clean, ""},
+		{"caption", "[voice 0:03 audio/ogg] " + clean + " listen", ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := motdVoiceUploadURL(test.text)
+			if ok != (test.want != "") || got != test.want {
+				t.Fatalf("motdVoiceUploadURL()=(%q,%v), want (%q,%v)", got, ok, test.want, test.want != "")
+			}
+		})
+	}
+}
+
 func TestSameHTTPSOrigin(t *testing.T) {
 	parse := func(raw string) *url.URL {
 		u, err := url.Parse(raw)

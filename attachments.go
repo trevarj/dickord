@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"io"
 	"mime"
@@ -22,7 +23,10 @@ const (
 	maxAttachmentURLLength = 400
 )
 
-var discordAttachmentPath = regexp.MustCompile(`^/(attachments|ephemeral-attachments)/[0-9]+/[0-9]+/[^/]+$`)
+var (
+	discordAttachmentPath = regexp.MustCompile(`^/(attachments|ephemeral-attachments)/[0-9]+/[0-9]+/[^/]+$`)
+	motdVoiceFallback     = regexp.MustCompile(`^\[voice ([0-9]+(?::[0-9]{2}){1,2}) (audio/[A-Za-z0-9!#$&^_.+-]+)(?: expires=([^\]\s]+))?\] (https://[^\s<>]+)$`)
+)
 
 type attachmentUploader struct {
 	downloadClient *http.Client
@@ -155,6 +159,39 @@ func attachmentHTTPSURL(raw string) (*url.URL, error) {
 		}
 	}
 	return u, nil
+}
+
+func motdVoiceUploadURL(text string) (string, bool) {
+	match := motdVoiceFallback.FindStringSubmatch(text)
+	if match == nil {
+		return "", false
+	}
+	parts := strings.Split(match[1], ":")
+	for index, part := range parts {
+		value, err := strconv.Atoi(part)
+		if err != nil || index > 0 && value > 59 {
+			return "", false
+		}
+	}
+	if match[3] != "" {
+		if _, err := time.Parse(time.RFC3339, match[3]); err != nil {
+			return "", false
+		}
+	}
+	voiceURL, err := url.Parse(match[4])
+	if err != nil {
+		return "", false
+	}
+	if voiceURL.Fragment != "" {
+		key, waveform, found := strings.Cut(voiceURL.Fragment, "=")
+		decoded, decodeErr := base64.RawURLEncoding.Strict().DecodeString(waveform)
+		if !found || key != "motd-wave" || decodeErr != nil || len(decoded) == 0 {
+			return "", false
+		}
+		voiceURL.Fragment = ""
+		voiceURL.RawFragment = ""
+	}
+	return voiceURL.String(), true
 }
 
 func sameHTTPSOrigin(a, b *url.URL) bool {

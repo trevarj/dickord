@@ -27,10 +27,11 @@ records the pinned upstream commit.
 ## Requirements
 
 - Docker with Compose support
-- An Ergo server with TLS, SASL, `account-tag`, and IRCv3 message tags
+- An Ergo server with TLS, SASL, `account-tag`, IRCv3 message tags, and
+  `draft/metadata-2` enabled for channel avatar metadata
 - A registered Ergo account for the bridge
 - A restricted Ergo OPER role permitting only the commands Dickord needs,
-  including `RELAYMSG` and `SAJOIN`
+  including `RELAYMSG`, `SAJOIN`, and the `metadata` role capability
 
 The `rdircd` IRC listener stays inside the Compose network and is not published
 to the host.

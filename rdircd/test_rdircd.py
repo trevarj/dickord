@@ -103,6 +103,48 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history.cursor_ts, 101)
 
 
+class AvatarURLTests(unittest.TestCase):
+    def test_user_avatar_urls_cover_custom_modern_legacy_and_partial_payloads(self):
+        self.assertEqual(
+            rdircd.discord_user_avatar_url({
+                "id": "8", "avatar": "a_ab12", "discriminator": "0",
+            }),
+            "https://cdn.discordapp.com/avatars/8/a_ab12.png?size=256",
+        )
+        modern_id = str(5 << 22)
+        self.assertEqual(
+            rdircd.discord_user_avatar_url({
+                "id": modern_id, "avatar": None, "discriminator": "0",
+            }),
+            "https://cdn.discordapp.com/embed/avatars/5.png",
+        )
+        self.assertEqual(
+            rdircd.discord_user_avatar_url({
+                "id": "8", "avatar": None, "discriminator": "1234",
+            }),
+            "https://cdn.discordapp.com/embed/avatars/4.png",
+        )
+        for user in (
+            {"id": "8"},
+            {"id": "8", "avatar": None},
+            {"avatar": "abcd"},
+            {"id": "not-numeric", "avatar": "abcd"},
+            {"id": "8", "avatar": ""},
+            {"id": "8", "avatar": None, "discriminator": "legacy"},
+        ):
+            with self.subTest(user=user):
+                self.assertIsNone(rdircd.discord_user_avatar_url(user))
+
+    def test_guild_icon_urls_distinguish_removal_from_missing_data(self):
+        self.assertEqual(
+            rdircd.discord_guild_icon_url({"id": "10", "icon": "abcd"}),
+            "https://cdn.discordapp.com/icons/10/abcd.png?size=256",
+        )
+        self.assertEqual(rdircd.discord_guild_icon_url({"id": "10", "icon": None}), "")
+        self.assertIsNone(rdircd.discord_guild_icon_url({"id": "10"}))
+        self.assertIsNone(rdircd.discord_guild_icon_url({"id": "x", "icon": "abcd"}))
+
+
 class AttachmentTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.conf = rdircd.RDIRCDConfigBase()
@@ -124,14 +166,17 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.channel = rdircd.adict(
             id="20", did="20", name="test", tid=None, private=False,
+            ct=rdircd.DiscordSession.c_chan_type.text, parent_id=None,
             users=rdircd.TimedCacheDict(60),
-            gg=rdircd.adict(id="10", chans={}),
+            gg=rdircd.adict(id="10", name="Guild; Hall", chans={}),
         )
         self.channel.gg.chans["20"] = self.channel
         self.protocol = rdircd.IRCProtocol.__new__(rdircd.IRCProtocol)
         self.protocol.conf, self.protocol.log = self.conf, Log()
         self.protocol.st_irc = rdircd.adict(
-            nick="bridge", chans={"test"}, typing_repeat=rdircd.adict(active={})
+            nick="bridge", user="bridge", host="rdircd", ts_watch=None,
+            chans={"test": rdircd.adict(topic="")},
+            typing_repeat=rdircd.adict(active={}),
         )
         self.wire = []
         self.protocol.data_send = self.wire.append
@@ -163,6 +208,139 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
 
     def frames(self):
         return [self.protocol._parse(line.rstrip(b"\r\n")) for line in self.wire]
+
+    def test_live_avatar_uses_global_author_on_every_line(self):
+        author = rdircd.adict(
+            id="8", username="other", avatar="a_ab12", discriminator="0",
+        )
+        self.session.op_msg(self.message(
+            "first\nsecond", author=author, member=rdircd.adict(avatar="guild_hash"),
+        ), "create")
+        frames = self.frames()
+        self.assertEqual([frame.params[1] for frame in frames], ["first", "second"])
+        self.assertTrue(all(
+            frame.tags["+dickord/avatar"]
+            == "https://cdn.discordapp.com/avatars/8/a_ab12.png?size=256"
+            for frame in frames
+        ))
+        self.wire.clear()
+        self.session.op_msg(self.message("missing avatar"), "create")
+        self.assertNotIn("+dickord/avatar", self.frames()[0].tags)
+
+    def test_initial_channel_metadata_and_guild_icon(self):
+        self.protocol.bridge = self.bridge
+        self.conf._irc_nick_sys = self.conf.irc_nick_sys
+        self.bridge.server_host = "rdircd"
+        self.bridge.cmd_chan_map_sync_tracking = lambda *_args, **_kwargs: None
+        self.bridge.cmd_chan_names = lambda *_args, **_kwargs: []
+        channel = rdircd.adict(name="test", topic="", cc=self.channel)
+        channel_map = rdircd.adict(test=channel)
+        channel_map.ø_online = False
+        self.channel.gg.icon = "abcd"
+        self.protocol.cmd_join("#test", cm=channel_map)
+        tagmsg = [frame for frame in self.frames() if frame.cmd == "tagmsg"]
+        self.assertEqual(len(tagmsg), 1)
+        self.assertEqual(
+            tagmsg[0].tags["+dickord/channel"],
+            '{"v":1,"guild_id":"10","guild_name":"Guild; Hall",'
+            '"channel_id":"20","channel_type":0,"parent_id":null}',
+        )
+        self.assertEqual(
+            tagmsg[0].tags["+dickord/guild-icon"],
+            "https://cdn.discordapp.com/icons/10/abcd.png?size=256",
+        )
+        self.assertEqual(tagmsg[0].params, ["#test"])
+
+        self.wire.clear()
+        self.channel.gg.icon = None
+        self.protocol.cmd_channel_metadata("#test", self.channel, guild_icon=True)
+        frame = self.frames()[0]
+        self.assertNotIn("+dickord/channel", frame.tags)
+        self.assertIn("+dickord/guild-icon", frame.tags)
+        self.assertEqual(frame.tags["+dickord/guild-icon"], "")
+
+        self.wire.clear()
+        dm = rdircd.adict(
+            id="30", ct=rdircd.DiscordSession.c_chan_type.private, parent_id=None,
+            gg=rdircd.adict(id=1, name="me", icon="abcd"),
+        )
+        dm_map = rdircd.adict(dm=rdircd.adict(name="dm", topic="", cc=dm))
+        dm_map.ø_online = False
+        self.protocol.cmd_join("#dm", cm=dm_map)
+        frame = [frame for frame in self.frames() if frame.cmd == "tagmsg"][0]
+        self.assertEqual(
+            frame.tags["+dickord/channel"],
+            '{"v":1,"guild_id":null,"guild_name":null,'
+            '"channel_id":"30","channel_type":1,"parent_id":null}',
+        )
+        self.assertNotIn("+dickord/guild-icon", frame.tags)
+
+    def test_channel_metadata_reemits_only_authoritative_changes(self):
+        self.protocol.bridge = self.bridge
+        self.conf._irc_nick_sys = self.conf.irc_nick_sys
+        self.bridge.server_host = "rdircd"
+        self.bridge.cmd_chan_map_sync_tracking = lambda *_args, **_kwargs: None
+        self.bridge.cmd_chan_names = lambda *_args, **_kwargs: []
+        channel = rdircd.adict(name="test", topic="", cc=self.channel)
+        channel_map = rdircd.adict(test=channel)
+        channel_map.ø_online = False
+        self.protocol.cmd_join("#test", cm=channel_map)
+
+        self.wire.clear()
+        self.protocol.cmd_chan_list_sync(channel_map)
+        self.assertEqual(self.wire, [])
+
+        self.channel.gg.name = "Renamed Guild"
+        self.protocol.cmd_chan_list_sync(channel_map)
+        frame = self.frames()[0]
+        self.assertEqual(
+            frame.tags["+dickord/channel"],
+            '{"v":1,"guild_id":"10","guild_name":"Renamed Guild",'
+            '"channel_id":"20","channel_type":0,"parent_id":null}',
+        )
+
+        self.wire.clear()
+        self.protocol.cmd_chan_list_sync(channel_map)
+        self.assertEqual(self.wire, [])
+
+        self.channel.ct = rdircd.DiscordSession.c_chan_type.thread
+        self.channel.parent_id = "40"
+        self.protocol.cmd_chan_list_sync(channel_map)
+        self.assertEqual(
+            self.frames()[0].tags["+dickord/channel"],
+            '{"v":1,"guild_id":"10","guild_name":"Renamed Guild",'
+            '"channel_id":"20","channel_type":11,"parent_id":"40"}',
+        )
+
+        self.wire.clear()
+        self.channel.parent_id = "41"
+        self.protocol.cmd_chan_list_sync(channel_map)
+        self.assertIn('"parent_id":"41"', self.frames()[0].tags["+dickord/channel"])
+
+    def test_channel_json_preserves_supported_dm_and_thread_types(self):
+        for channel_type in (1, 3, 18):
+            with self.subTest(channel_type=channel_type):
+                descriptor = rdircd.discord_channel_json(rdircd.adict(
+                    id="30", ct=channel_type, parent_id=None,
+                    gg=rdircd.adict(id=1, name="me"),
+                ))
+                self.assertEqual(rdircd.json.loads(descriptor), {
+                    "v": 1, "guild_id": None, "guild_name": None,
+                    "channel_id": "30", "channel_type": channel_type,
+                    "parent_id": None,
+                })
+                self.assertNotIn(": ", descriptor)
+        for channel_type in (10, 11, 12):
+            with self.subTest(channel_type=channel_type):
+                descriptor = rdircd.discord_channel_json(rdircd.adict(
+                    id="31", ct=channel_type, parent_id="20",
+                    gg=rdircd.adict(id="10", name="Guild"),
+                ))
+                self.assertEqual(rdircd.json.loads(descriptor), {
+                    "v": 1, "guild_id": "10", "guild_name": "Guild",
+                    "channel_id": "31", "channel_type": channel_type,
+                    "parent_id": "20",
+                })
 
     def test_parser_tags_only_actual_attachments_with_terminal_links(self):
         urls = [
@@ -198,23 +376,33 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_history_attachment_tags_survive_replay_to_another_client(self):
         url = "https://cdn.discordapp.com/attachments/10/20/photo.png?ex=1"
+        avatar = "https://cdn.discordapp.com/avatars/7/abcd.png?size=256"
         self.conf.irc_prefix_pinned = "saved: "
         self.discord.conn_req = mock.AsyncMock(return_value=[
-            self.message(urls=[url], pinned=True)
+            self.message(
+                urls=[url], pinned=True,
+                author={
+                    "id": "7", "username": "owner", "avatar": "abcd",
+                    "discriminator": "0",
+                },
+            )
         ])
         history = await self.discord.cmd_history(self.channel, 100, hwm=2)
         message = history.messages[0]
+        self.assertEqual(message.discord_avatar, avatar)
         for _ in range(2):
             self.bridge.cmd_msg_discord(
                 self.channel, message.nick, "[history] " + message.line,
                 tags=message.tags, conn=self.protocol,
                 discord_msg_id=message.msg_id, discord_user_id=message.discord_user_id,
+                discord_avatar=message.discord_avatar,
                 discord_reply_msg_id=message.discord_reply_msg_id,
                 discord_self=message.discord_self,
             )
         self.assertEqual(self.wire[0], self.wire[1])
         self.assertEqual(len(self.wire), 2)
         frame = self.frames()[1]
+        self.assertEqual(frame.tags["+dickord/avatar"], avatar)
         self.assertEqual(frame.tags["+dickord/attachment"], url)
         self.assertEqual(frame.tags["+dickord/discord-reply-msgid"], "100")
         self.assertEqual(frame.tags["+dickord/self"], "1")
@@ -307,6 +495,54 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         frames = self.frames()
         self.assertEqual([frame.params[1] for frame in frames], ["file preview", "file preview"])
         self.assertEqual([frame.tags.get("+dickord/attachment") for frame in frames], [None, url])
+
+
+class GuildIconUpdateTests(unittest.TestCase):
+    def test_guild_updates_retain_icon_and_signal_only_changes(self):
+        emitted = []
+        session = rdircd.DiscordSession.__new__(rdircd.DiscordSession)
+        session.log = Log()
+        session.st_da = rdircd.adict(
+            me=rdircd.adict(id=1),
+            guilds={1: rdircd.adict(id=1)},
+        )
+        session.discord = rdircd.adict(
+            bridge=rdircd.adict(
+                uid=lambda *_args, **_kwargs: "guild",
+                cmd_guild_icon=lambda guild: emitted.append(
+                    rdircd.discord_guild_icon_url(guild)
+                ),
+            ),
+            cmd_guild_event=lambda *_args, **_kwargs: None,
+        )
+        session.ws_req_guild_sync = lambda: None
+
+        session.op_ev_guilds(
+            rdircd.adict(id="10", name="Guild", icon="abcd"), init=True,
+        )
+        guild = session.st_da.guilds["10"]
+        self.assertEqual(guild.icon, "abcd")
+        self.assertEqual(emitted, [])
+
+        session.op_ev_guilds(rdircd.adict(id="10", name="Guild"))
+        session.op_ev_guilds(rdircd.adict(id="10", name="Guild", icon="abcd"))
+        self.assertEqual(guild.icon, "abcd")
+        self.assertEqual(emitted, [])
+
+        session.op_ev_guilds(rdircd.adict(id="10", name="Guild", icon="ef01"))
+        session.op_ev_guilds(rdircd.adict(id="10", name="Guild", icon=None))
+        self.assertEqual(emitted, [
+            "https://cdn.discordapp.com/icons/10/ef01.png?size=256",
+            "",
+        ])
+
+        emitted.clear()
+        session.op_ev_del_guild(rdircd.adict(id="10", unavailable=True))
+        self.assertIn("10", session.st_da.guilds)
+        self.assertEqual(emitted, [])
+        session.op_ev_del_guild(rdircd.adict(id="10"))
+        self.assertNotIn("10", session.st_da.guilds)
+        self.assertEqual(emitted, [""])
 
 
 class PayloadTests(unittest.TestCase):

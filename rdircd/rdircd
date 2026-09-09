@@ -949,6 +949,37 @@ def force_list(v):
 	elif not isinstance(v, list): v = [v]
 	return v
 
+def discord_user_avatar_url(user):
+	if not user or 'avatar' not in user or not re.fullmatch(
+			r'[0-9]+', uid := str(user.get('id') or '') ): return
+	avatar = user.get('avatar')
+	if avatar is None:
+		if user.get('discriminator') is None: return
+		discriminator = str(user.get('discriminator'))
+		if not re.fullmatch(r'[0-9]+', discriminator): return
+		index = int(discriminator) % 5 if discriminator != '0' else (int(uid) >> 22) % 6
+		return f'https://cdn.discordapp.com/embed/avatars/{index}.png'
+	if not isinstance(avatar, str) or not re.fullmatch(r'(?:a_)?[0-9a-f]+', avatar): return
+	return f'https://cdn.discordapp.com/avatars/{uid}/{avatar}.png?size=256'
+
+def discord_guild_icon_url(guild):
+	if not guild or 'icon' not in guild or not re.fullmatch(
+			r'[0-9]+', gid := str(guild.get('id') or '') ): return
+	icon = guild.get('icon')
+	if icon is None: return ''
+	if not isinstance(icon, str) or not re.fullmatch(r'(?:a_)?[0-9a-f]+', icon): return
+	return f'https://cdn.discordapp.com/icons/{gid}/{icon}.png?size=256'
+
+def discord_channel_json(cc):
+	gg = cc.gg
+	guild_id = None if str(gg.id) == '1' else str(gg.id)
+	parent_id = cc.get('parent_id')
+	return json.dumps(dict(
+		v=1, guild_id=guild_id, guild_name=None if guild_id is None else gg.get('name'),
+		channel_id=str(cc.id), channel_type=int(cc.ct),
+		parent_id=str(parent_id) if parent_id else None,
+	), ensure_ascii=False, separators=(',', ':'))
+
 def dict_update(d, du_iter=None, sync=True):
 	'Update or replace dict contents, returning difference in the latter case.'
 	keys_old, du = set(d.keys()), dict()
@@ -1808,11 +1839,12 @@ class IRCProtocol(asyncio.Protocol):
 				self.bridge.cmd_chan_watch_replay(self.st_irc.ts_watch, c=c, conn=self)
 		name = c.name if c else self.chan_name(chan)
 		# topic=None will always be updated on cmd_chan_list_sync
-		self.st_irc.chans[name] = adict(topic=c and c.topic)
+		ch = self.st_irc.chans[name] = adict(topic=c and c.topic, cc=c and c.get('cc'))
 		self.send(f':{self.src_self()} JOIN {chan}')
 		self.send_topic(chan, c=c)
 		self.send_names(chan, own=True, c=c)
 		self.send(0, f'MODE {chan} +v {self.st_irc.nick}')
+		if cc := ch.get('cc'): self.cmd_channel_metadata(chan, cc, guild_icon=True)
 
 	def recv_cmd_part(self, chan, reason=None):
 		chan_list, cm = chan.split(','), self.bridge.cmd_chan_map()
@@ -1916,10 +1948,12 @@ class IRCProtocol(asyncio.Protocol):
 
 	def cmd_chan_list_sync(self, cm):
 		for name, ch in self.st_irc.chans.items():
+			chan = self.chan_spec(name)
+			if cc := ch.get('cc'): self.cmd_channel_metadata(chan, cc)
 			topic = cm[name].topic if name in cm else self.nx_chan_warn
 			if topic == ch.topic: continue
 			self.log.debug('Client-topic update [ {} ]: {!r} -> {!r}', name, ch.topic, topic)
-			self.send_topic_update(chan := self.chan_spec(name), topic)
+			self.send_topic_update(chan, topic)
 			ch.topic = topic
 			if name in cm: continue
 			self.send(f':{self.src_sys()} NOTICE {chan} :{self.nx_chan_warn}')
@@ -1967,7 +2001,7 @@ class IRCProtocol(asyncio.Protocol):
 	def tag_escape(value):
 		return str(value).replace('\\', '\\\\').replace(';', '\\:').replace(' ', '\\s').replace('\r', '\\r').replace('\n', '\\n')
 
-	def dickord_tags( self, discord_msg_id=None, discord_user_id=None,
+	def dickord_tags( self, discord_msg_id=None, discord_user_id=None, discord_avatar=None,
 			discord_reply_msg_id=None, discord_self=False, discord_event=None, discord_emoji=None,
 			discord_emoji_api=None, discord_burst=False, discord_attachment=None ):
 		tags = list()
@@ -1977,6 +2011,9 @@ class IRCProtocol(asyncio.Protocol):
 				('+dickord/discord-reply-msgid', discord_reply_msg_id) ]:
 			if value and str(value).isdigit(): tags.append(f'{tag}={value}')
 			elif value: self.log.warning('Ignoring invalid Discord snowflake tag {}={!r}', tag, value)
+		if discord_avatar is not None:
+			tag = '+dickord/avatar'
+			tags.append(tag if not discord_avatar else f'{tag}={self.tag_escape(discord_avatar)}')
 		for tag, value in [
 				('+dickord/event', discord_event), ('+dickord/emoji', discord_emoji),
 				('+dickord/discord-emoji', discord_emoji_api),
@@ -1987,8 +2024,8 @@ class IRCProtocol(asyncio.Protocol):
 		return '' if not tags else f'@{";".join(tags)} '
 
 	def cmd_msg_chan( self, nick, chan, text, notice=False, joined=False,
-			discord_msg_id=None, discord_user_id=None, discord_reply_msg_id=None,
-			discord_self=False,
+			discord_msg_id=None, discord_user_id=None, discord_avatar=None,
+			discord_reply_msg_id=None, discord_self=False,
 			discord_event=None, discord_emoji=None, discord_emoji_api=None,
 			discord_burst=False, discord_attachment=None ):
 		'''Send message to channel that this IRC client is connected to.
@@ -2002,11 +2039,24 @@ class IRCProtocol(asyncio.Protocol):
 				and not notice and not irc_name_eq(nick, self.st_irc.nick) ):
 			self.send(f':{self.src_discord(nick)} JOIN {chan}')
 		tags = self.dickord_tags(
-			discord_msg_id, discord_user_id, discord_reply_msg_id,
+			discord_msg_id, discord_user_id, discord_avatar, discord_reply_msg_id,
 			discord_self, discord_event, discord_emoji, discord_emoji_api,
 			discord_burst, discord_attachment )
 		self.send(f'{tags}:{self.src_discord(nick)} {msg_type} {chan} :{text}')
 		self.st_irc.typing_repeat.active.pop((nick, chan), None)
+
+	def cmd_channel_metadata(self, chan, cc, guild_icon=False):
+		chan = self.chan_spec(chan)
+		if not (ch := self.st_irc.chans.get(self.chan_name(chan))): return
+		tags, channel_json = list(), discord_channel_json(cc)
+		if channel_json != ch.get('dickord_channel'):
+			tags.append(f'+dickord/channel={self.tag_escape(channel_json)}')
+			ch.dickord_channel = channel_json
+		if guild_icon and str(cc.gg.get('id')) != '1' and (
+				icon := discord_guild_icon_url(cc.gg) ) is not None:
+			tag = '+dickord/guild-icon'
+			tags.append(tag if not icon else f'{tag}={self.tag_escape(icon)}')
+		if tags: self.send(f'@{";".join(tags)} :{self.src_sys()} TAGMSG {chan}')
 
 	def cmd_typing(self, nick, chan, repeated=False):
 		interval, timeout = self.conf.irc_typing_interval, self.conf.irc_typing_timeout
@@ -2318,14 +2368,15 @@ class Discord:
 				else: nick = self.user_name(author)
 				result.messages.append(adict(
 					nick=nick, line=line.strip(), tags=tags, ts=msg_ts, msg_id=m.id,
-					discord_user_id=author_id,
+					discord_user_id=author_id, discord_avatar=discord_user_avatar_url(author),
 					discord_reply_msg_id=self.session.op_msg_reply_id(m),
 					discord_self=bool(author_id and author_id == self.st_da.user.get('id')) ))
 			if flake == flake_last or len(msg_batch) < hwm: break
 		if stopped: result.messages.append(adict(
 			line=f'<...stopped history-fetch after configured message-limit [ {limit:,d} ]...>',
 			nick=None, tags=adict(), ts=result.cursor_ts, msg_id=None,
-			discord_user_id='', discord_reply_msg_id=None, discord_self=False ))
+			discord_user_id='', discord_avatar=None,
+			discord_reply_msg_id=None, discord_self=False ))
 		result.messages.sort(key=op.itemgetter('ts'))
 		return result
 
@@ -3677,6 +3728,8 @@ class DiscordSession:
 		else:
 			self.log.debug('Guild delete event: guild={}', gid)
 			self.discord.cmd_guild_event(gid, 'Discord was DELETED')
+			gg.icon = None
+			self.discord.bridge.cmd_guild_icon(gg)
 			self.st_da.guilds.pop(gid, None)
 
 	def op_ev_del_chan(self, m):
@@ -3696,7 +3749,8 @@ class DiscordSession:
 			self.discord.cmd_chan_thread_event(cc, 'deleted')
 
 	def op_ev_guilds(self, guilds, init=False):
-		gs_new, gs_chans, gs_vcs = {1: self.st_da.me}, dict(), cs.defaultdict(set)
+		gs_new, gs_chans, gs_vcs, icons_updated = \
+			{1: self.st_da.me}, dict(), cs.defaultdict(set), list()
 		for g in force_list(guilds):
 			if g.get('unavailable'): continue # can be sent in "ready" event
 			if g.id == self.st_da.me.id:
@@ -3706,6 +3760,7 @@ class DiscordSession:
 			if 'properties' in g: g = adict(g.pop('properties'), **g)
 			gg = gs_new.setdefault( g.id,
 				self.st_da.guilds.get(g.id, adict(id=g.id, chans=dict())) )
+			icon_changed = 'icon' in g and gg.get('icon', ...) != g.icon
 			if init: gg.synced = False # ox_guild_sub needs to be re-sent after reconnect
 			if g.id not in self.st_da.guilds:
 				prefix = self.discord.bridge.uid('guild', gg.id, kh=gg.get('kh'))
@@ -3715,6 +3770,8 @@ class DiscordSession:
 			gg.update( name=g.name, ts_joined=ts_joined,
 				roles=dict((r.id, r) for r in g.get('roles', list())),
 				emojis=self.op_ev_guilds_emojis(g.get('emojis') or list()) )
+			if 'icon' in g: gg.icon = g.icon
+			if icon_changed: icons_updated.append(gg)
 			if 'channels' in g: gs_chans[g.id, 'c'] = g.channels # missing in guild_update evs
 			if 'threads' in g: gs_chans[g.id, 't'] = g.threads # only "joined" ones are listed here!
 			gs_vcs[g.id].update(vs.get('channel_id') for vs in g.get('voice_states') or list())
@@ -3723,7 +3780,9 @@ class DiscordSession:
 			self.op_ev_chans(gid, chans, sync=sk == 'c')
 			for cid, cc in self.st_da.guilds[gid].chans.items():
 				if cid in gs_vcs[gid]: cc.vc_active = True
-		if not init: self.ws_req_guild_sync() # triggered separately on init
+		if not init:
+			for gg in icons_updated: self.discord.bridge.cmd_guild_icon(gg)
+			self.ws_req_guild_sync() # triggered separately on init
 
 	def op_ev_guilds_emojis(self, emojis):
 		return dict(
@@ -3842,7 +3901,8 @@ class DiscordSession:
 
 			cc.update(
 				id=c.id, gg=gg, did=f'#{gg.id}-{c.id}', name=name, topic=topic,
-				ct=cc_type, private=cc_private, pos=c.get('position', -1)+1,
+				ct=cc_type, parent_id=c.get('parent_id') if c_tid else None,
+				private=cc_private, pos=c.get('position', -1)+1,
 				tags=tags, last_msg_ts=self.discord.flake_parse(c.get('last_message_id')) )
 			chans_updated[c.id] = cc
 		return chans_updated, new_threads
@@ -3978,6 +4038,7 @@ class DiscordSession:
 		#  prefixes and call cmd_msg_recv multiple times for different channels.
 		nick, ts = m.get('author'), time.time()
 		discord_user_id = nick and nick.get('id') or ''
+		discord_avatar = discord_user_avatar_url(nick)
 		discord_reply_msg_id = self.op_msg_reply_id(m)
 		msg_from_self = bool( nick and self.st_da.get('user')
 			and nick.get('id') == self.st_da.user.get('id') )
@@ -4086,6 +4147,7 @@ class DiscordSession:
 			new_msg_flake=not msg_is_update and m.id, msg_id=m.id,
 			nonce=m.get('nonce'), skip_monitor=skip_mirrored_msg_in_monitor,
 			discord_user_id=discord_user_id,
+			discord_avatar=discord_avatar,
 			discord_reply_msg_id=discord_reply_msg_id,
 			discord_self=msg_from_self,
 			discord_event='edit' if msg_is_update else None )
@@ -4920,6 +4982,7 @@ class RDIRCD:
 						line = f'[{ts_iso8601(m.ts)}] {m.line}'
 						self.cmd_msg_discord( info.cc, m.nick, line, tags=m.tags, conn=conn,
 							discord_msg_id=m.msg_id, discord_user_id=m.discord_user_id,
+							discord_avatar=m.discord_avatar,
 							discord_reply_msg_id=m.discord_reply_msg_id,
 							discord_self=m.discord_self )
 					return notice_cmd(f'--- end of replay [{len(history.messages)}]')
@@ -5145,6 +5208,12 @@ class RDIRCD:
 		if not cm0 and cm.ø_online: self.cmd_delay('chan_map', self.cmd_chan_map_sync)
 		return cm
 
+	def cmd_guild_icon(self, gg):
+		for conn in self.irc_conns.values():
+			for name, ch in conn.st_irc.chans.items():
+				if not (cc := ch.get('cc')) or cc.gg.id != gg.id: continue
+				conn.cmd_channel_metadata(name, cc, guild_icon=True)
+
 	def cmd_chan_map_flush(self):
 		'Schedule channel-map rebuild/recache in a moment'
 		# Sync is scheduled for topic updates or something eventful like that
@@ -5229,7 +5298,7 @@ class RDIRCD:
 			cache_track(gi.gg, 'name chans ts_joined')
 			for cc in sorted( gi.gg.chans.values(),
 					key=lambda cc: (cc.get('pos') or 999, cc.name) ):
-				cache_track(cc, 'name topic pos tags')
+				cache_track(cc, 'name topic pos tags ct parent_id')
 				tags = ''.join( '['+( k.replace(*'_-') +
 					(v and f'={v}') )+'] ' for k, v in cc.tags.items()
 					if k.replace(*'_-') not in self.conf._irc_topic_hide_tags )
@@ -5265,6 +5334,7 @@ class RDIRCD:
 				line = f'[{ts_iso8601(m.ts)}] {m.line}'
 				self.cmd_msg_discord( cc, m.nick, line, tags=m.tags, conn=conn,
 					discord_msg_id=m.msg_id, discord_user_id=m.discord_user_id,
+					discord_avatar=m.discord_avatar,
 					discord_reply_msg_id=m.discord_reply_msg_id,
 					discord_self=m.discord_self )
 			notice_cmd(f'--- end of replay [{len(history.messages)}]')
@@ -5740,7 +5810,7 @@ class RDIRCD:
 
 	def cmd_msg_discord( self, cc, nick=None, line=None, name_irc=None,
 			tags=None, ts=None, conn=None, notice=None, skip_monitor=False,
-			msg_id=None, discord_msg_id=None, discord_user_id=None,
+			msg_id=None, discord_msg_id=None, discord_user_id=None, discord_avatar=None,
 			discord_reply_msg_id=None,
 			discord_self=False, discord_event=None, discord_emoji=None,
 			discord_emoji_api=None, discord_burst=False ) -> bool:
@@ -5806,6 +5876,7 @@ class RDIRCD:
 				conn.cmd_msg_chan( nick, name, ln, notice=notice, joined=joined and not n,
 					discord_msg_id=discord_msg_id or msg_id,
 					discord_user_id=discord_user_id,
+					discord_avatar=discord_avatar,
 					discord_reply_msg_id=discord_reply_msg_id if not n else None,
 					discord_self=discord_self,
 					discord_event=discord_event, discord_emoji=discord_emoji,
