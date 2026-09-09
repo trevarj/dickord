@@ -910,6 +910,7 @@ func connectTestUser(t *testing.T, port int, roots *x509.CertPool, account, pass
 	}
 	conn.AddCallback("PRIVMSG", handleMessage)
 	conn.AddCallback("TAGMSG", handleMessage)
+	conn.AddCallback("NOTICE", handleMessage)
 	conn.AddCallback("REDACT", handleMessage)
 	if err := conn.Connect(); err != nil {
 		t.Fatalf("connect %s: %v", account, err)
@@ -1118,8 +1119,8 @@ func (f *fakeRDirCD) handle(conn net.Conn) {
 			if len(params) >= 3 {
 				f.redactions <- params[2]
 			}
-		case strings.HasPrefix(upper, "PRIVMSG #ME.CHAT.ALICE :"):
-			f.outbound <- capturedOutbound{text: line[strings.Index(line, " :")+2:], tags: tags}
+		case strings.HasPrefix(upper, "PRIVMSG #ME.CHAT.ALICE "):
+			f.outbound <- capturedOutbound{text: strings.TrimPrefix(strings.SplitN(line, " ", 3)[2], ":"), tags: tags}
 			if ergoMsgID := tags["+dickord/ergo-msgid"]; ergoMsgID != "" {
 				f.sendTo(conn, "@+dickord/discord-msgid="+testOutboundDiscordMessageID+";+reply="+ergoMsgID+" :fake TAGMSG #me.chat.alice")
 			}
