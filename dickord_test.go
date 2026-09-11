@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bufio"
+	"io"
+	"log"
+	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/ergochat/irc-go/ircevent"
@@ -166,39 +172,45 @@ func TestReactionTags(t *testing.T) {
 	}
 }
 
-func TestRDirCDChannelMetadataRequiresMappingAndCapability(t *testing.T) {
+func TestRDirCDChannelDescriptorCaching(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	rdircd := &ircevent.Connection{}
 	message := ircmsg.MakeMessage(
 		map[string]string{"+dickord/channel": `{"v":1}`},
 		"core!u@rdircd", "TAGMSG", "#source",
 	)
+	newTestBridge := func() *Bridge {
+		bridge := newBridge(RuntimeConfig{Config: Config{Channels: ChannelConfig{CatchUpLimit: 1}}}, logger)
+		bridge.rdircd = rdircd
+		bridge.ergo = &ircevent.Connection{}
+		bridge.ergoRegistered = true
+		bridge.operReady = true
+		return bridge
+	}
 
 	t.Run("unmapped", func(t *testing.T) {
-		bridge := &Bridge{
-			rdircd:         rdircd,
-			ergo:           &ircevent.Connection{},
-			ergoRegistered: true,
-			operReady:      true,
-			sourceToDest:   make(map[string]string),
-		}
+		bridge := newTestBridge()
 		bridge.onRDirCDTagMessage(rdircd, message)
 		if len(bridge.sourceToDest) != 0 {
-			t.Fatalf("metadata synthesized a mapping: %v", bridge.sourceToDest)
+			t.Fatalf("descriptor synthesized a mapping: %v", bridge.sourceToDest)
+		}
+		if len(bridge.descriptors) != 0 {
+			t.Fatalf("unmapped descriptor was cached: %v", bridge.descriptors)
 		}
 	})
 
-	t.Run("no metadata capability", func(t *testing.T) {
-		ergo := &ircevent.Connection{}
-		bridge := &Bridge{
-			cfg:            RuntimeConfig{Config: Config{Channels: ChannelConfig{CatchUpLimit: 1}}},
-			rdircd:         rdircd,
-			ergo:           ergo,
-			ergoRegistered: true,
-			operReady:      true,
-			sourceToDest:   map[string]string{"#source": "#destination"},
-			discordRefs:    make(map[string]discordMessageRef),
-			ergoByDiscord:  make(map[discordRefKey][]string),
+	t.Run("old rdircd connection", func(t *testing.T) {
+		bridge := newTestBridge()
+		bridge.sourceToDest["#source"] = "#destination"
+		bridge.onRDirCDTagMessage(&ircevent.Connection{}, message)
+		if len(bridge.descriptors) != 0 {
+			t.Fatalf("descriptor from old connection was cached: %v", bridge.descriptors)
 		}
+	})
+
+	t.Run("mapped current connection without metadata capability", func(t *testing.T) {
+		bridge := newTestBridge()
+		bridge.sourceToDest["#source"] = "#destination"
 		message := ircmsg.MakeMessage(map[string]string{
 			"+dickord/channel":       `{"v":1}`,
 			"+dickord/guild-icon":    "https://example.test/icon.png",
@@ -206,10 +218,422 @@ func TestRDirCDChannelMetadataRequiresMappingAndCapability(t *testing.T) {
 			"+reply":                 "ergo-message",
 		}, "core!u@rdircd", "TAGMSG", "#source")
 		bridge.onRDirCDTagMessage(rdircd, message)
+		if got := bridge.descriptors["#source"]; got != `{"v":1}` {
+			t.Fatalf("cached descriptor=%q", got)
+		}
 		if ref := bridge.discordRefs["ergo-message"]; ref.source != "#source" || ref.messageID != "123456789012345678" {
 			t.Fatalf("non-metadata TAGMSG handling broke without the capability: %+v", ref)
 		}
 	})
+
+	t.Run("empty descriptor", func(t *testing.T) {
+		bridge := newTestBridge()
+		bridge.sourceToDest["#source"] = "#destination"
+		bridge.descriptors["#source"] = `{"v":1}`
+		bridge.onRDirCDTagMessage(rdircd, ircmsg.MakeMessage(
+			map[string]string{"+dickord/channel": ""},
+			"core!u@rdircd", "TAGMSG", "#source",
+		))
+		if _, cached := bridge.descriptors["#source"]; cached {
+			t.Fatal("empty descriptor remained cached")
+		}
+	})
+}
+
+func TestChannelSnapshotRequest(t *testing.T) {
+	tests := []struct {
+		name     string
+		tags     map[string]string
+		params   []string
+		ready    bool
+		current  bool
+		wantSeed bool
+	}{
+		{
+			name:     "valid",
+			tags:     map[string]string{"account": "owner", "+dickord/channel-request": "1", "+draft/react": "👍"},
+			params:   []string{"#control"},
+			ready:    true,
+			current:  true,
+			wantSeed: true,
+		},
+		{
+			name:    "unknown version",
+			tags:    map[string]string{"account": "owner", "+dickord/channel-request": "2", "+draft/react": "👍"},
+			params:  []string{"#control"},
+			ready:   true,
+			current: true,
+		},
+		{
+			name:    "wrong target",
+			tags:    map[string]string{"account": "owner", "+dickord/channel-request": "1"},
+			params:  []string{"#destination"},
+			ready:   true,
+			current: true,
+		},
+		{
+			name:    "no target",
+			tags:    map[string]string{"account": "owner", "+dickord/channel-request": "1"},
+			ready:   true,
+			current: true,
+		},
+		{
+			name:    "multiple targets",
+			tags:    map[string]string{"account": "owner", "+dickord/channel-request": "1"},
+			params:  []string{"#control", "#destination"},
+			ready:   true,
+			current: true,
+		},
+		{
+			name:    "historical",
+			tags:    map[string]string{"account": "owner", "+dickord/channel-request": "1", "batch": "history"},
+			params:  []string{"#control"},
+			ready:   true,
+			current: true,
+		},
+		{
+			name:    "unauthorized",
+			tags:    map[string]string{"account": "mallory", "+dickord/channel-request": "1"},
+			params:  []string{"#control"},
+			ready:   true,
+			current: true,
+		},
+		{
+			name:    "relay loop",
+			tags:    map[string]string{"account": "owner", "+dickord/channel-request": "1", "draft/relaymsg": "other"},
+			params:  []string{"#control"},
+			ready:   true,
+			current: true,
+		},
+		{
+			name:    "rdircd not ready",
+			tags:    map[string]string{"account": "owner", "+dickord/channel-request": "1"},
+			params:  []string{"#control"},
+			current: true,
+		},
+		{
+			name:   "old Ergo connection",
+			tags:   map[string]string{"account": "owner", "+dickord/channel-request": "1"},
+			params: []string{"#control"},
+			ready:  true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			bridge, capture := newRelayTestBridge(t)
+			bridge.cfg.OwnerAccountsSet = map[string]struct{}{"owner": {}}
+			bridge.rdircdReady = test.ready
+			bridge.destToSource["#control"] = "#rdircd.control"
+			bridge.destToSource["#destination"] = "#source"
+			bridge.descriptors["#source"] = relayTestDescriptor
+			conn := &ircevent.Connection{}
+			if test.current {
+				conn = bridge.ergo
+			}
+			bridge.onErgoTagMessage(conn, ircmsg.MakeMessage(
+				test.tags, "owner!u@host", "TAGMSG", test.params...,
+			))
+			messages := capture()
+			if !test.wantSeed {
+				if len(messages) != 0 {
+					t.Fatalf("invalid snapshot request emitted %+v", messages)
+				}
+				return
+			}
+			if len(messages) != 1 || messages[0].Command != "TAGMSG" ||
+				len(messages[0].Params) != 1 || messages[0].Params[0] != "#destination" {
+				t.Fatalf("snapshot seed=%+v", messages)
+			}
+			if _, got := messages[0].GetTag("+dickord/channel"); got != relayTestDescriptor {
+				t.Fatalf("snapshot descriptor=%q, want %q", got, relayTestDescriptor)
+			}
+		})
+	}
+}
+
+func TestNewRDirCDConnectionDropsOldSnapshot(t *testing.T) {
+	bridge, capture := newRelayTestBridge(t)
+	rdircd := bridge.rdircd
+	bridge.sourceToDest["#old"] = "#old-destination"
+	bridge.destToSource["#discord.control"] = "#rdircd.control"
+	bridge.descriptors["#old"] = `{"v":1}`
+
+	bridge.onRDirCDRegistered(rdircd)
+	_ = capture()
+	bridge.cfg.OwnerAccountsSet = map[string]struct{}{"owner": {}}
+	bridge.rdircdReady = true
+	bridge.onErgoTagMessage(bridge.ergo, ircmsg.MakeMessage(
+		map[string]string{"account": "owner", "+dickord/channel-request": "1"},
+		"owner!u@host", "TAGMSG", "#discord.control",
+	))
+	if messages := capture(); len(messages) != 0 {
+		t.Fatalf("new rdircd connection exposed stale snapshot: %+v", messages)
+	}
+}
+
+const relayTestDescriptor = `{"v":1,"channel_id":"123456789012345678","guild_id":"223456789012345678","guild_name":"Example; Server 🌈","type":0,"is_thread":false,"channel_name":"release.notes_20 \\ 🌈","guild_icon_url":"https://example.test/icon.png"}`
+
+func TestRDirCDChannelDescriptorTransport(t *testing.T) {
+	for _, metadata := range []bool{false, true} {
+		t.Run("metadata="+strconv.FormatBool(metadata), func(t *testing.T) {
+			var caps []string
+			if metadata {
+				caps = append(caps, "draft/metadata-2")
+			}
+			bridge, capture := newRelayTestBridge(t, caps...)
+			for _, icon := range []string{"https://example.test/icon.png", ""} {
+				descriptor := relayTestDescriptor
+				if icon == "" {
+					descriptor = strings.Replace(descriptor, `"https://example.test/icon.png"`, "null", 1)
+				}
+				bridge.onRDirCDTagMessage(bridge.rdircd, ircmsg.MakeMessage(map[string]string{
+					"+dickord/channel":    descriptor,
+					"+dickord/guild-icon": icon,
+				}, "core!u@rdircd", "TAGMSG", "#source"))
+				messages := capture()
+				wantCount := 1
+				if metadata {
+					wantCount++
+				}
+				if len(messages) != wantCount {
+					t.Fatalf("descriptor/icon update emitted %d messages, want %d: %+v", len(messages), wantCount, messages)
+				}
+				seed := messages[0]
+				if seed.Command != "TAGMSG" || len(seed.Params) != 1 || seed.Params[0] != "#destination" {
+					t.Fatalf("descriptor seed=%+v", seed)
+				}
+				if _, got := seed.GetTag("+dickord/channel"); got != descriptor {
+					t.Fatalf("descriptor seed=%q, want %q", got, descriptor)
+				}
+				if metadata {
+					avatar := messages[1]
+					want := "#destination SET avatar"
+					if icon != "" {
+						want += " " + icon
+					}
+					if avatar.Command != "METADATA" || strings.Join(avatar.Params, " ") != want {
+						t.Fatalf("avatar metadata=%+v, want %q", avatar, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestRDirCDChannelDescriptorSizeBounds(t *testing.T) {
+	rawLimit := relayTestDescriptor + strings.Repeat("\t", 2048-len(relayTestDescriptor))
+	padding := 3072 - len(ircmsg.EscapeTagValue(relayTestDescriptor))
+	escapedLimit := relayTestDescriptor + strings.Repeat(" ", padding/2) + strings.Repeat("\t", padding%2)
+	for _, test := range []struct {
+		name     string
+		value    string
+		accepted bool
+	}{
+		{"JSON byte limit", rawLimit, true},
+		{"JSON byte overflow", rawLimit + "\t", false},
+		{"escaped byte limit", escapedLimit, true},
+		{"escaped byte overflow", escapedLimit + "\t", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bridge, capture := newRelayTestBridge(t)
+			bridge.descriptors["#source"] = relayTestDescriptor
+			bridge.onRDirCDTagMessage(bridge.rdircd, ircmsg.MakeMessage(
+				map[string]string{"+dickord/channel": test.value},
+				"core!u@rdircd", "TAGMSG", "#source",
+			))
+			bridge.relayToErgo("#destination", "Alice", "unchanged body", false, discordMessageRef{source: "#source"}, "", false)
+			messages := capture()
+			wantDescriptor := relayTestDescriptor
+			wantCommands := []string{"RELAYMSG"}
+			if test.accepted {
+				wantDescriptor = test.value
+				wantCommands = []string{"TAGMSG", "RELAYMSG"}
+			}
+			if len(messages) != len(wantCommands) {
+				t.Fatalf("descriptor update emitted %+v, want %v", messages, wantCommands)
+			}
+			for i, message := range messages {
+				if message.Command != wantCommands[i] || message.Params[0] != "#destination" {
+					t.Fatalf("descriptor update message=%+v, want %s #destination", message, wantCommands[i])
+				}
+				if _, got := message.GetTag("+dickord/channel"); got != wantDescriptor {
+					t.Fatalf("descriptor was truncated or invalid update replaced cached state: got %q, want %q", got, wantDescriptor)
+				}
+			}
+			relay := messages[len(messages)-1]
+			if len(relay.Params) != 3 || relay.Params[1] != "Alice/discord" || relay.Params[2] != "unchanged body" {
+				t.Fatalf("descriptor size changed relay attribution/body: %+v", relay)
+			}
+		})
+	}
+}
+
+func TestRelayMessageTagBudget(t *testing.T) {
+	padding := 3072 - len(ircmsg.EscapeTagValue(relayTestDescriptor))
+	descriptor := relayTestDescriptor + strings.Repeat(" ", padding/2) + strings.Repeat("\t", padding%2)
+	for _, labeled := range []bool{false, true} {
+		for _, extra := range []int{0, 1} {
+			t.Run("labeled="+strconv.FormatBool(labeled)+"/overflow="+strconv.Itoa(extra), func(t *testing.T) {
+				var caps []string
+				if labeled {
+					caps = append(caps, "batch", "labeled-response")
+				}
+				bridge, capture := newRelayTestBridge(t, caps...)
+				bridge.onRDirCDTagMessage(bridge.rdircd, ircmsg.MakeMessage(
+					map[string]string{"+dickord/channel": descriptor},
+					"core!u@rdircd", "TAGMSG", "#source",
+				))
+				const reply = "original-message"
+				tags := map[string]string{
+					"+dickord/nonce":   "1",
+					"+dickord/channel": descriptor,
+					"+dickord/avatar":  "https://example.test/",
+					"+reply":           reply,
+				}
+				if labeled {
+					// The first label on a fresh connection occupies one byte.
+					tags["label"] = "1"
+				}
+				probe := ircmsg.MakeMessage(tags, "", "RELAYMSG", "#destination", "Alice/discord", "hello 🌈")
+				line, err := probe.LineBytesStrict(true, 512)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tagBytes := strings.IndexByte(string(line), ' ') - 1
+				avatar := tags["+dickord/avatar"] + strings.Repeat("x", ircmsg.MaxlenClientTagData-tagBytes+extra)
+				bridge.ergoByDiscord[discordRefKey{source: "#source", messageID: "323456789012345678"}] = []string{reply}
+				bridge.relayToErgo("#destination", "Alice", "hello 🌈", false, discordMessageRef{
+					source: "#source", replyMessageID: "323456789012345678",
+				}, avatar, true)
+				messages := capture()
+				if len(messages) != 2 || messages[0].Command != "TAGMSG" {
+					t.Fatalf("expected a complete seed and exactly one relay, got %+v", messages)
+				}
+				if _, got := messages[0].GetTag("+dickord/channel"); got != descriptor {
+					t.Fatalf("standalone seed lost complete descriptor: %q", got)
+				}
+				message := messages[1]
+				if message.Command != "RELAYMSG" || len(message.Params) != 3 || message.Params[0] != "#destination" ||
+					message.Params[1] != "Alice/discord" || message.Params[2] != "hello 🌈" {
+					t.Fatalf("optional descriptor changed relay attribution/body: %+v", message)
+				}
+				for key, want := range map[string]string{"+dickord/nonce": "1", "+reply": reply, "+dickord/avatar": avatar} {
+					if present, got := message.GetTag(key); !present || got != want {
+						t.Fatalf("relay lost required tag %q: got %q, want %q", key, got, want)
+					}
+				}
+				if present, label := message.GetTag("label"); present != labeled || (labeled && label == "") {
+					t.Fatalf("relay lost actual label: present=%v label=%q", present, label)
+				}
+				if present, got := message.GetTag("+dickord/channel"); present != (extra == 0) || (present && got != descriptor) {
+					t.Fatalf("descriptor budget decision: present=%v descriptor=%q", present, got)
+				}
+			})
+		}
+	}
+}
+
+func newRelayTestBridge(t *testing.T, caps ...string) (*Bridge, func() []ircmsg.Message) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	caps = append([]string{"message-tags"}, caps...)
+	conn := &ircevent.Connection{
+		Server: listener.Addr().String(), Nick: "dickord", User: "dickord",
+		RequestCaps: caps, Timeout: 5 * time.Second, KeepAlive: time.Hour,
+		Log: log.New(io.Discard, "", 0),
+	}
+	serverReady := make(chan net.Conn, 1)
+	var reader *bufio.Reader
+	handshake := make(chan error, 1)
+	go func() {
+		server, err := listener.Accept()
+		if err != nil {
+			handshake <- err
+			return
+		}
+		serverReady <- server
+		reader = bufio.NewReader(server)
+		handshake <- func() error {
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					return err
+				}
+				message, err := ircmsg.ParseLine(line)
+				if err != nil {
+					return err
+				}
+				if message.Command != "CAP" || len(message.Params) == 0 {
+					continue
+				}
+				var response string
+				switch message.Params[0] {
+				case "LS":
+					response = ":server CAP * LS :" + strings.Join(caps, " ")
+				case "REQ":
+					response = ":server CAP * ACK :" + message.Params[1]
+				case "END":
+					response = ":server 001 dickord :Welcome\r\n:server 376 dickord :End of MOTD"
+				}
+				if _, err := io.WriteString(server, response+"\r\n"); err != nil {
+					return err
+				}
+				if message.Params[0] == "END" {
+					return nil
+				}
+			}
+		}()
+	}()
+	if err := conn.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-handshake; err != nil {
+		t.Fatal(err)
+	}
+	server := <-serverReady
+	stopped := make(chan struct{})
+	go func() {
+		conn.Loop()
+		close(stopped)
+	}()
+	t.Cleanup(func() {
+		conn.Quit()
+		_ = server.Close()
+		<-stopped
+	})
+	bridge := newBridge(RuntimeConfig{Config: Config{Channels: ChannelConfig{CatchUpLimit: 1}}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	bridge.rdircd = &ircevent.Connection{}
+	bridge.ergo = conn
+	bridge.ergoRegistered, bridge.operReady, bridge.relayReady = true, true, true
+	bridge.sourceToDest["#source"] = "#destination"
+	return bridge, func() []ircmsg.Message {
+		t.Helper()
+		if err := conn.Send("PING", "capture-end"); err != nil {
+			t.Fatal(err)
+		}
+		if err := server.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		var messages []ircmsg.Message
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			message, err := ircmsg.ParseLineStrict(line, true, 512)
+			if err != nil {
+				t.Fatalf("invalid client wire line: %v", err)
+			}
+			if message.Command == "PING" && len(message.Params) == 1 && message.Params[0] == "capture-end" {
+				return messages
+			}
+			messages = append(messages, message)
+		}
+	}
 }
 
 func TestRelayAddressTranslation(t *testing.T) {

@@ -151,6 +151,9 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.conf.irc_names_join = self.conf.discord_embed_info = False
         self.conf.discord_msg_interact_cache = False
         self.conf._irc_dedup_interval = 0
+        self.conf._irc_names_timeout = 60
+        self.conf._discord_name_preference_order = ["nick", "display", "login"]
+        self.conf.renames = {}
         self.conf._discord_msg_old_prefix = self.conf._discord_msg_old_ignore = {}
         self.conf.recv_filters = self.conf.recv_repls = self.conf.unmon_filters = {}
         for key in (
@@ -167,6 +170,7 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.channel = rdircd.adict(
             id="20", did="20", name="test", tid=None, private=False,
             ct=rdircd.DiscordSession.c_chan_type.text, parent_id=None,
+            names=rdircd.adict(raw="test"), threads={},
             users=rdircd.TimedCacheDict(60),
             gg=rdircd.adict(id="10", name="Guild; Hall", chans={}),
         )
@@ -184,6 +188,7 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.bridge.cmd_msg_monitor = lambda *_args, **_kwargs: None
         self.discord = rdircd.Discord.__new__(rdircd.Discord)
         self.discord.bridge, self.discord.conf, self.discord.log = self.bridge, self.conf, Log()
+        self.bridge.discord = self.discord
         self.discord.st_eris = rdircd.adict(enabled=True)
         self.discord.flake_parse = lambda value: float(value) if value else None
         self.discord.flake_build = lambda value: str(int(value))
@@ -192,8 +197,10 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.session = rdircd.DiscordSession.__new__(rdircd.DiscordSession)
         self.session.conf, self.session.log, self.session._repr = self.conf, Log(), repr
         self.session.discord, self.discord.session = self.discord, self.session
+        me = rdircd.adict(id=1, name="me", chans={})
         self.session.st_da = rdircd.adict(
-            user={"id": "7"}, guilds={"10": self.channel.gg}, embed_info={}, icache={}
+            user={"id": "7", "username": "owner", "global_name": "Owner"}, me=me,
+            guilds={1: me, "10": self.channel.gg}, embed_info={}, icache={}
         )
 
     def message(self, content="", urls=(), **kwargs):
@@ -208,6 +215,13 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
 
     def frames(self):
         return [self.protocol._parse(line.rstrip(b"\r\n")) for line in self.wire]
+
+    def process_channel(self, guild, **payload):
+        channels, _ = self.session.op_ev_chans_process(
+            guild, rdircd.adict(payload), dedup=True,
+        )
+        guild.chans.update(channels)
+        return guild.chans[payload["id"]]
 
     def test_live_avatar_uses_global_author_on_every_line(self):
         author = rdircd.adict(
@@ -233,6 +247,7 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.bridge.server_host = "rdircd"
         self.bridge.cmd_chan_map_sync_tracking = lambda *_args, **_kwargs: None
         self.bridge.cmd_chan_names = lambda *_args, **_kwargs: []
+        self.protocol.st_irc.chans.pop("test")
         channel = rdircd.adict(name="test", topic="", cc=self.channel)
         channel_map = rdircd.adict(test=channel)
         channel_map.ø_online = False
@@ -243,7 +258,9 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             tagmsg[0].tags["+dickord/channel"],
             '{"v":1,"guild_id":"10","guild_name":"Guild; Hall",'
-            '"channel_id":"20","channel_type":0,"parent_id":null}',
+            '"channel_id":"20","channel_type":0,"parent_id":null,"channel_name":"test",'
+            '"guild_icon_url":"https://cdn.discordapp.com/icons/10/abcd.png?size=256",'
+            '"channel_icon_url":null}',
         )
         self.assertEqual(
             tagmsg[0].tags["+dickord/guild-icon"],
@@ -255,14 +272,16 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.channel.gg.icon = None
         self.protocol.cmd_channel_metadata("#test", self.channel, guild_icon=True)
         frame = self.frames()[0]
-        self.assertNotIn("+dickord/channel", frame.tags)
+        descriptor = rdircd.json.loads(frame.tags["+dickord/channel"])
+        self.assertIsNone(descriptor["guild_icon_url"])
+        self.assertEqual(descriptor["channel_name"], "test")
         self.assertIn("+dickord/guild-icon", frame.tags)
         self.assertEqual(frame.tags["+dickord/guild-icon"], "")
 
         self.wire.clear()
         dm = rdircd.adict(
             id="30", ct=rdircd.DiscordSession.c_chan_type.private, parent_id=None,
-            gg=rdircd.adict(id=1, name="me", icon="abcd"),
+            gg=rdircd.adict(id=1, name="me", icon="abcd"), names=rdircd.adict(raw=""),
         )
         dm_map = rdircd.adict(dm=rdircd.adict(name="dm", topic="", cc=dm))
         dm_map.ø_online = False
@@ -271,9 +290,92 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             frame.tags["+dickord/channel"],
             '{"v":1,"guild_id":null,"guild_name":null,'
-            '"channel_id":"30","channel_type":1,"parent_id":null}',
+            '"channel_id":"30","channel_type":1,"parent_id":null,'
+            '"channel_name":"DM 30","guild_icon_url":null,"channel_icon_url":null}',
         )
         self.assertNotIn("+dickord/guild-icon", frame.tags)
+
+    def test_repeated_join_only_refreshes_the_descriptor(self):
+        self.protocol.bridge = self.bridge
+        self.conf._irc_nick_sys = self.conf.irc_nick_sys
+        self.bridge.server_host = "rdircd"
+        syncs, replays = [], []
+        self.bridge.cmd_chan_map_sync_tracking = lambda *_args, **_kwargs: syncs.append(True)
+        self.bridge.cmd_chan_watch_replay = lambda *_args, **_kwargs: replays.append(True)
+        self.bridge.cmd_chan_names = lambda *_args, **_kwargs: []
+        channel_map = rdircd.adict(
+            test=rdircd.adict(name="test", topic="", cc=self.channel),
+        )
+        channel_map.ø_online = False
+        self.protocol.st_irc.chans.pop("test")
+        self.protocol.cmd_join("#test", cm=channel_map)
+        descriptor = [
+            frame.tags["+dickord/channel"]
+            for frame in self.frames() if frame.cmd == "tagmsg"
+        ][0]
+
+        self.wire.clear()
+        syncs.clear()
+        channel_map.ø_online = True
+        self.protocol.st_irc.ts_watch = 123
+        self.protocol.cmd_join("#test", cm=channel_map)
+
+        frames = self.frames()
+        self.assertEqual([frame.cmd for frame in frames], ["tagmsg"])
+        self.assertEqual(frames[0].tags["+dickord/channel"], descriptor)
+        self.assertNotIn("+dickord/guild-icon", frames[0].tags)
+        self.assertEqual(syncs, [])
+        self.assertEqual(replays, [])
+        self.assertEqual(self.protocol.st_irc.ts_watch, 123)
+
+    async def test_watch_silent_matches_watch_without_success_chatter(self):
+        self.conf.watch = rdircd.adict_rev()
+        self.conf.state_fwd = lambda *_args, **_kwargs: []
+        saved, cursors, notices = [], [], []
+        self.conf.update_file_section = lambda section, values: saved.append(
+            (section, dict(values))
+        )
+        self.conf.state_watch = lambda channel_id, *_args: cursors.append(channel_id)
+        self.bridge.irc_discord_info = lambda _name: rdircd.adict(
+            cc=self.channel, gg=self.channel.gg,
+        )
+        self.protocol.cmd_msg_chan_sys = lambda _chan, text: notices.append(text)
+
+        await self.bridge.irc_cmd_topic(self.protocol, "test", "log watch")
+        interactive = dict(self.conf.watch), list(saved), list(cursors)
+        self.assertEqual(notices, ["History watch/replay enabled for this channel"])
+
+        self.conf.watch = rdircd.adict_rev()
+        saved.clear()
+        cursors.clear()
+        notices.clear()
+        await self.bridge.irc_cmd_topic(self.protocol, "test", "log watch-silent")
+        self.assertEqual((dict(self.conf.watch), saved, cursors), interactive)
+        self.assertEqual(notices, [])
+
+        await self.bridge.irc_cmd_topic(self.protocol, "test", "log watch-silent")
+        self.assertEqual((dict(self.conf.watch), saved, cursors), interactive)
+        self.assertEqual(notices, [])
+
+        self.conf.watch = rdircd.adict_rev()
+        saved.clear()
+        cursors.clear()
+        self.conf.misc_conf_readonly = True
+        await self.bridge.irc_cmd_topic(self.protocol, "test", "log watch-silent")
+        self.assertEqual(saved, [])
+        self.assertEqual(cursors, ["20"])
+        self.assertEqual(notices, [
+            "History watch/replay changes for channel will not be stored "
+            "due to read-only configuration",
+        ])
+
+        notices.clear()
+        self.bridge.irc_discord_info = lambda _name: None
+        with self.assertRaises(rdircd.IRCBridgeSignal):
+            await self.bridge.irc_cmd_topic(self.protocol, "test", "log watch-silent")
+        self.assertEqual(notices, [
+            "topic-cmd-error: Not a discord channel: #test",
+        ])
 
     def test_channel_metadata_reemits_only_authoritative_changes(self):
         self.protocol.bridge = self.bridge
@@ -281,6 +383,7 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.bridge.server_host = "rdircd"
         self.bridge.cmd_chan_map_sync_tracking = lambda *_args, **_kwargs: None
         self.bridge.cmd_chan_names = lambda *_args, **_kwargs: []
+        self.protocol.st_irc.chans.pop("test")
         channel = rdircd.adict(name="test", topic="", cc=self.channel)
         channel_map = rdircd.adict(test=channel)
         channel_map.ø_online = False
@@ -296,7 +399,8 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             frame.tags["+dickord/channel"],
             '{"v":1,"guild_id":"10","guild_name":"Renamed Guild",'
-            '"channel_id":"20","channel_type":0,"parent_id":null}',
+            '"channel_id":"20","channel_type":0,"parent_id":null,'
+            '"channel_name":"test","guild_icon_url":null,"channel_icon_url":null}',
         )
 
         self.wire.clear()
@@ -309,7 +413,8 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.frames()[0].tags["+dickord/channel"],
             '{"v":1,"guild_id":"10","guild_name":"Renamed Guild",'
-            '"channel_id":"20","channel_type":11,"parent_id":"40"}',
+            '"channel_id":"20","channel_type":11,"parent_id":"40",'
+            '"channel_name":"test","guild_icon_url":null,"channel_icon_url":null}',
         )
 
         self.wire.clear()
@@ -317,17 +422,26 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.protocol.cmd_chan_list_sync(channel_map)
         self.assertIn('"parent_id":"41"', self.frames()[0].tags["+dickord/channel"])
 
+        self.wire.clear()
+        self.channel.names.raw = "release.notes_20 🛠️"
+        self.protocol.cmd_chan_list_sync(channel_map)
+        self.assertEqual(
+            rdircd.json.loads(self.frames()[0].tags["+dickord/channel"])["channel_name"],
+            "release.notes_20 🛠️",
+        )
+
     def test_channel_json_preserves_supported_dm_and_thread_types(self):
         for channel_type in (1, 3, 18):
             with self.subTest(channel_type=channel_type):
                 descriptor = rdircd.discord_channel_json(rdircd.adict(
                     id="30", ct=channel_type, parent_id=None,
-                    gg=rdircd.adict(id=1, name="me"),
-                ))
+                    gg=rdircd.adict(id=1, name="me"), names=rdircd.adict(raw=""),
+                ), "7")
                 self.assertEqual(rdircd.json.loads(descriptor), {
                     "v": 1, "guild_id": None, "guild_name": None,
                     "channel_id": "30", "channel_type": channel_type,
-                    "parent_id": None,
+                    "parent_id": None, "channel_name": "DM 30", "guild_icon_url": None,
+                    "channel_icon_url": None,
                 })
                 self.assertNotIn(": ", descriptor)
         for channel_type in (10, 11, 12):
@@ -335,12 +449,231 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
                 descriptor = rdircd.discord_channel_json(rdircd.adict(
                     id="31", ct=channel_type, parent_id="20",
                     gg=rdircd.adict(id="10", name="Guild"),
-                ))
+                    names=rdircd.adict(raw="release.notes_20"),
+                ), "7")
                 self.assertEqual(rdircd.json.loads(descriptor), {
                     "v": 1, "guild_id": "10", "guild_name": "Guild",
                     "channel_id": "31", "channel_type": channel_type,
-                    "parent_id": "20",
+                    "parent_id": "20", "channel_name": "release.notes_20",
+                    "guild_icon_url": None, "channel_icon_url": None,
                 })
+
+    def test_channel_names_survive_irc_aliases_voice_suffixes_and_thread_templates(self):
+        self.conf.renames[("chan", "@31")] = "irc-release-alias"
+        self.conf.irc_thread_chan_name_len = 4
+        self.channel.gg.icon = "abcd"
+        for channel_id, channel_type, raw_name in (
+            ("31", 0, "release.notes_20"),
+            ("32", 2, "🛠️ Voice.notes_20 + Q&A!"),
+            ("33", 11, "🧵 release.notes_20 :: shipped!"),
+        ):
+            with self.subTest(channel_type=channel_type):
+                channel = self.process_channel(
+                    self.channel.gg, id=channel_id, type=channel_type,
+                    name=raw_name, parent_id="20", icon="ef01",
+                )
+                irc_name = self.bridge.irc_name(channel.name)
+                self.assertNotEqual(irc_name, raw_name)
+                descriptor = rdircd.json.loads(rdircd.discord_channel_json(channel, "7"))
+                self.assertEqual(descriptor["channel_name"], raw_name)
+                self.assertEqual(
+                    descriptor["guild_icon_url"],
+                    "https://cdn.discordapp.com/icons/10/abcd.png?size=256",
+                )
+
+    def test_direct_dm_name_excludes_self_and_ignores_irc_user_alias(self):
+        del self.discord.user_name
+        self.conf.renames[("user", "@8")] = "irc-user-alias"
+        self.conf.irc_chan_private = "fixed.{id}"
+        for recipient, expected in (
+            ({"id": "8", "username": "alice_irc", "global_name": "Alice Smith 🦊"}, "Alice Smith 🦊"),
+            ({"id": "8", "username": "alice_irc", "global_name": None}, "alice_irc"),
+            ({"id": "8", "username": None, "global_name": None}, "8"),
+        ):
+            with self.subTest(recipient=recipient):
+                channel = self.process_channel(
+                    self.session.st_da.me, id="30", type=1, name="Not the recipient",
+                    recipients=[self.session.st_da.user, recipient],
+                )
+                descriptor = rdircd.json.loads(rdircd.discord_channel_json(channel, "7"))
+                self.assertEqual(descriptor["channel_name"], expected)
+                self.assertIsNone(descriptor["guild_name"])
+                self.assertIsNone(descriptor["guild_icon_url"])
+
+    def test_direct_dm_icon_uses_only_the_current_peer(self):
+        del self.discord.user_name
+        self.conf.irc_chan_private = "fixed.{id}"
+        self.conf._irc_nick_sys = self.conf.irc_nick_sys
+        self.protocol.bridge = self.bridge
+        self.session.st_da.user.update(
+            global_name="Aardvark", avatar="ffff", discriminator="0",
+        )
+        peer = {
+            "id": "8", "username": "zed", "global_name": "Zed",
+            "avatar": "a_ab12", "discriminator": "0",
+        }
+        channel = self.process_channel(
+            self.session.st_da.me, id="30", type=1, name=None, recipients=[peer],
+        )
+        self.protocol.cmd_channel_metadata("#test", channel)
+        self.assertEqual(
+            rdircd.json.loads(self.frames()[0].tags["+dickord/channel"])[
+                "channel_icon_url"
+            ],
+            "https://cdn.discordapp.com/avatars/8/a_ab12.png?size=256",
+        )
+
+        self.wire.clear()
+        channel = self.process_channel(
+            self.session.st_da.me, id="30", type=1, topic="Only the topic changed",
+        )
+        self.protocol.cmd_channel_metadata("#test", channel)
+        self.assertEqual(self.wire, [])
+
+        channel = self.process_channel(
+            self.session.st_da.me, id="30", type=1, recipients=[{
+                "id": "8", "username": "zed", "global_name": "Zed", "avatar": None,
+            }],
+        )
+        self.protocol.cmd_channel_metadata("#test", channel)
+        self.assertIsNone(
+            rdircd.json.loads(self.frames()[0].tags["+dickord/channel"])[
+                "channel_icon_url"
+            ],
+        )
+        self.wire.clear()
+        self.protocol.cmd_channel_metadata("#test", channel)
+        self.assertEqual(self.wire, [])
+
+    def test_group_dm_names_keep_named_title_and_sort_raw_recipients(self):
+        del self.discord.user_name
+        self.conf.irc_chan_private = "fixed.{id}"
+        recipients = [
+            {"id": "10", "username": "alias10", "global_name": "ALICE"},
+            {"id": "9", "username": "alias9", "global_name": "alice"},
+            {"id": "31", "username": "alias31", "global_name": "SSam"},
+            {"id": "30", "username": "alias30", "global_name": "ßam"},
+            {"id": "8", "username": "bob", "avatar": "ab12"},
+            self.session.st_da.user,
+        ]
+        for channel_type in (3, 18):
+            for name, expected in (
+                ("  Team.release_20 🛠️!  ", "  Team.release_20 🛠️!  "),
+                ("  ", "alice, ALICE, bob, ßam, SSam"),
+            ):
+                with self.subTest(channel_type=channel_type, name=name):
+                    channel = self.process_channel(
+                        self.session.st_da.me, id="30", type=channel_type,
+                        name=name, recipients=recipients,
+                    )
+                    descriptor = rdircd.json.loads(rdircd.discord_channel_json(channel, "7"))
+                    self.assertEqual(descriptor["channel_name"], expected)
+                    self.assertIsNone(descriptor["channel_icon_url"])
+                    recipients.reverse()
+
+    def test_only_derived_group_title_is_truncated_by_unicode_code_points(self):
+        del self.discord.user_name
+        self.conf.irc_chan_private = "fixed.{id}"
+        for width in (49, 50):
+            first, second = "😀" * width, "🦊" * width
+            title = f"{first}, {second}"
+            channel = self.process_channel(
+                self.session.st_da.me, id="30", type=3, name=None, recipients=[
+                    {"id": "8", "global_name": first},
+                    {"id": "9", "global_name": second},
+                ],
+            )
+            descriptor = rdircd.json.loads(rdircd.discord_channel_json(channel, "7"))
+            self.assertEqual(
+                descriptor["channel_name"], title if width == 49 else title[:99] + "…",
+            )
+        channel = self.process_channel(
+            self.session.st_da.me, id="30", type=3, name="🦊" * 100,
+        )
+        self.assertEqual(
+            rdircd.json.loads(rdircd.discord_channel_json(channel, "7"))["channel_name"],
+            "🦊" * 100,
+        )
+
+    def test_partial_channel_payloads_preserve_names_and_recipients_until_present(self):
+        del self.discord.user_name
+        self.conf.irc_chan_private = "fixed.{chat_name}.{id}"
+        guild_channel = self.process_channel(
+            self.channel.gg, id="31", type=0, name="release.notes_20 🛠️",
+        )
+        guild_channel = self.process_channel(
+            self.channel.gg, id="31", type=0, topic="Only the topic changed",
+        )
+        self.assertEqual(
+            rdircd.json.loads(rdircd.discord_channel_json(guild_channel, "7"))["channel_name"],
+            "release.notes_20 🛠️",
+        )
+        channel = self.process_channel(
+            self.session.st_da.me, id="30", type=3, name="Named group 🦊",
+            recipients=[{"id": "8", "username": "alice", "global_name": "Alice Smith"}],
+        )
+        channel = self.process_channel(
+            self.session.st_da.me, id="30", type=3, topic="Only the topic changed",
+        )
+        self.assertEqual(
+            rdircd.json.loads(rdircd.discord_channel_json(channel, "7"))["channel_name"],
+            "Named group 🦊",
+        )
+        for fields, expected in (
+            ({"name": None}, "Alice Smith"),
+            ({"recipients": [{"id": "9", "username": "Bob"}]}, "Bob"),
+            ({"recipients": []}, "DM 30"),
+            ({"name": "Renamed.group_20 🛠️"}, "Renamed.group_20 🛠️"),
+        ):
+            channel = self.process_channel(self.session.st_da.me, id="30", type=3, **fields)
+            self.assertEqual(
+                rdircd.json.loads(rdircd.discord_channel_json(channel, "7"))["channel_name"],
+                expected,
+            )
+
+    def test_recipient_events_refresh_descriptors_without_reemitting_unchanged_values(self):
+        del self.discord.user_name
+        self.conf.irc_chan_private = "fixed.{id}"
+        self.conf._irc_nick_sys = self.conf.irc_nick_sys
+        self.bridge.server_host = "rdircd"
+        self.bridge.irc_conns = {"bridge": self.protocol}
+        self.protocol.bridge = self.bridge
+        self.discord.cmd_msg_recv = lambda *_args, **_kwargs: None
+        payload = dict(
+            id="30", type=3, name=None, recipients=[{"id": "8", "username": "Bob"}],
+        )
+        channel = self.process_channel(self.session.st_da.me, **payload)
+        self.protocol.st_irc.chans["test"].cc = channel
+        self.protocol.cmd_channel_metadata("#test", channel)
+        self.wire.clear()
+
+        event = rdircd.adict(
+            channel_id="30", user={"id": "9", "username": "alice", "global_name": "Alice Smith"},
+        )
+        self.session.op_ev_recipient(event, "add")
+        self.assertEqual([frame.cmd for frame in self.frames()], ["tagmsg"])
+        self.assertEqual(
+            rdircd.json.loads(self.frames()[0].tags["+dickord/channel"])["channel_name"],
+            "Alice Smith, Bob",
+        )
+        self.wire.clear()
+        self.session.op_ev_recipient(event, "add")
+        self.assertEqual(self.wire, [])
+
+        self.session.op_ev_recipient(event, "remove")
+        self.assertEqual(
+            rdircd.json.loads(self.frames()[0].tags["+dickord/channel"])["channel_name"], "Bob",
+        )
+        self.wire.clear()
+        self.session.op_ev_recipient(event, "remove")
+        self.assertEqual(self.wire, [])
+
+        self.session.op_ev_recipient(event, "add")
+        channel = self.process_channel(self.session.st_da.me, **payload)
+        self.protocol.cmd_channel_metadata("#test", channel)
+        self.assertEqual(
+            rdircd.json.loads(self.frames()[-1].tags["+dickord/channel"])["channel_name"], "Bob",
+        )
 
     def test_parser_tags_only_actual_attachments_with_terminal_links(self):
         urls = [

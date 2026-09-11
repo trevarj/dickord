@@ -45,12 +45,15 @@ const (
 	testReplyDiscordID           = "666666666666666666"
 	testDMChannelID              = "777777777777777777"
 	testThreadChannelID          = "888888888888888888"
+	testQuietThreadID            = "889999999999999999"
 	testThreadSource             = "#friends.thread.dynamic"
+	testQuietThreadSource        = "#friends.thread.quiet"
 	testDiscordAvatarURL         = "https://cdn.discordapp.com/avatars/" + testDiscordUserID + "/abcdef.png?size=256"
 	testGuildIconURL             = "https://cdn.discordapp.com/icons/" + testGuildID + "/abcdef.png?size=256"
-	testDMChannelJSON            = `{"v":1,"guild_id":null,"guild_name":null,"channel_id":"` + testDMChannelID + `","channel_type":1,"parent_id":null}`
-	testGuildChannelJSON         = `{"v":1,"guild_id":"` + testGuildID + `","guild_name":"Friends; Guild","channel_id":"` + testGuildChannelID + `","channel_type":0,"parent_id":null}`
-	testThreadChannelJSON        = `{"v":1,"guild_id":"` + testGuildID + `","guild_name":"Friends; Guild","channel_id":"` + testThreadChannelID + `","channel_type":11,"parent_id":"` + testGuildChannelID + `"}`
+	testDMChannelJSON            = `{"v":1,"guild_id":null,"guild_name":null,"channel_id":"` + testDMChannelID + `","channel_type":1,"parent_id":null,"channel_name":"Alice Smith","guild_icon_url":null}`
+	testGuildChannelJSON         = `{"v":1,"guild_id":"` + testGuildID + `","guild_name":"Friends; Guild","channel_id":"` + testGuildChannelID + `","channel_type":0,"parent_id":null,"channel_name":"release.notes_20","guild_icon_url":"` + testGuildIconURL + `"}`
+	testThreadChannelJSON        = `{"v":1,"guild_id":"` + testGuildID + `","guild_name":"Friends; Guild","channel_id":"` + testThreadChannelID + `","channel_type":11,"parent_id":"` + testGuildChannelID + `","channel_name":"dynamic.thread_20 🧵","guild_icon_url":"` + testGuildIconURL + `"}`
+	testQuietThreadJSON          = `{"v":1,"guild_id":"` + testGuildID + `","guild_name":"Friends; Guild","channel_id":"` + testQuietThreadID + `","channel_type":11,"parent_id":"` + testGuildChannelID + `","channel_name":"release.notes_20 🛠️","guild_icon_url":"` + testGuildIconURL + `"}`
 )
 
 type capturedReaction struct {
@@ -134,7 +137,7 @@ func TestErgoIntegration(t *testing.T) {
 	defer filehost.Close()
 
 	temp := t.TempDir()
-	certPool, port := startTestErgo(t, temp, filehost.URL+"/filehost/")
+	certPool, port, ergoName := startTestErgo(t, temp, filehost.URL+"/filehost/", 0)
 	registerTestAccount(t, port, certPool, "Dickord", "bridgepass")
 	registerTestAccount(t, port, certPool, "owner", "ownerpass")
 	registerTestAccount(t, port, certPool, "mallory", "mallorypass")
@@ -199,12 +202,27 @@ func TestErgoIntegration(t *testing.T) {
 	}()
 
 	waitSignal(t, fake.accepted, "initial rdircd connection")
+	waitSignal(t, fake.lists, "initial rdircd LIST")
+	waitSignal(t, fake.listed, "initial rdircd LIST completion")
 	waitSignal(t, fake.joined, "bridge joining fake rdircd channel")
+	if got := waitText(t, fake.control, "initial history limit configuration"); got !=
+		"set -s discord-msg-history-fetch-limit 300" {
+		t.Fatalf("initial rdircd control command=%q", got)
+	}
 	for range 2 {
-		if got := waitText(t, fake.topics, "automatic watch command"); got != "log watch" {
+		if got := waitText(t, fake.topics, "automatic watch command"); got != "log watch-silent" {
 			t.Fatalf("automatic watch args=%q", got)
 		}
 	}
+	for _, source := range []string{"#me.chat.alice", "#friends.general"} {
+		if !fake.isWatched(source) {
+			t.Fatalf("automatic watch was not persisted for %s", source)
+		}
+	}
+	waitCachedDescriptors(t, bridge, map[string]string{
+		"#me.chat.alice":   testDMChannelJSON,
+		"#friends.general": testGuildChannelJSON,
+	})
 	bridge.mu.RLock()
 	ergo, metadataNegotiated := bridge.ergo, false
 	if ergo != nil {
@@ -215,16 +233,97 @@ func TestErgoIntegration(t *testing.T) {
 		t.Fatal("bridge did not negotiate draft/metadata-2")
 	}
 
-	owner, ownerMessages, ownerJoined, ownerMetadata := connectTestUser(t, port, certPool, "owner", "ownerpass", "#discord.me.chat.alice", false)
+	owner, ownerMessages, ownerJoined, ownerMetadata, ownerDescriptors, ownerControl := connectTestUser(
+		t, port, certPool, "owner", "ownerpass", "#discord.me.chat.alice", false,
+	)
 	defer owner.Quit()
 	waitSignal(t, ownerJoined, "owner autojoin after connecting late")
-
-	waitChannelMetadataJSON(t, owner, ownerMetadata, "#discord.me.chat.alice", testDMChannelJSON)
-	waitChannelMetadataJSON(t, owner, ownerMetadata, "#discord.friends.general", testGuildChannelJSON)
-	if err := owner.Send("METADATA", "*", "SUB", "dickord/channel"); err != nil {
+	if err := owner.Join("#discord.control,#discord.friends.general"); err != nil {
 		t.Fatal(err)
 	}
-	waitMetadataSubscription(t, ownerMetadata, "dickord/channel")
+	assertChannelDescriptor := func(msg ircmsg.Message, description string) {
+		t.Helper()
+		if _, descriptor := msg.GetTag("+dickord/channel"); descriptor != testDMChannelJSON {
+			t.Fatalf("%s descriptor=%q, want %q", description, descriptor, testDMChannelJSON)
+		}
+	}
+	snapshot := map[string]string{
+		"#discord.me.chat.alice":   testDMChannelJSON,
+		"#discord.friends.general": testGuildChannelJSON,
+	}
+
+	synchronizeRDirCD(t, bridge, fake)
+	releaseList := fake.holdNextList()
+	defer releaseList()
+	if err := owner.SendWithTags(map[string]string{"+dickord/channel-request": "1"}, "TAGMSG", "#discord.control"); err != nil {
+		t.Fatal(err)
+	}
+	waitSignal(t, fake.lists, "portal snapshot LIST")
+	waitChannelDescriptors(t, ownerDescriptors, snapshot)
+	if err := owner.SendWithTags(map[string]string{"+dickord/channel-request": "1"}, "TAGMSG", "#discord.control"); err != nil {
+		t.Fatal(err)
+	}
+	waitChannelDescriptors(t, ownerDescriptors, snapshot)
+	releaseList()
+	waitSignal(t, fake.listed, "portal snapshot LIST completion")
+	waitChannelDescriptors(t, ownerDescriptors, snapshot)
+	assertNoPortalRefresh(t, fake, ownerDescriptors, ownerMessages, ownerControl, "coalesced portal snapshot")
+
+	fake.setListChannel(fakeRDirCDChannel{
+		source: testQuietThreadSource, topic: "Quiet thread",
+		descriptor: testQuietThreadJSON, icon: testGuildIconURL,
+	})
+	if err := owner.SendWithTags(map[string]string{"+dickord/channel-request": "1"}, "TAGMSG", "#discord.control"); err != nil {
+		t.Fatal(err)
+	}
+	waitSignal(t, fake.lists, "quiet-channel refresh LIST")
+	waitChannelDescriptors(t, ownerDescriptors, snapshot)
+	waitSignal(t, fake.listed, "quiet-channel refresh LIST completion")
+	quietDestination := destinationName(testQuietThreadSource, cfg.Channels.Prefix, channelLength(ergo.ISupport(), cfg.Channels.MaxNameLength))
+	waitChannelDescriptors(t, ownerDescriptors, map[string]string{
+		"#discord.me.chat.alice":   testDMChannelJSON,
+		"#discord.friends.general": testGuildChannelJSON,
+		quietDestination:           testQuietThreadJSON,
+	})
+	if got := waitText(t, fake.topics, "new quiet-channel watch"); got != "log watch-silent" {
+		t.Fatalf("quiet-channel watch args=%q", got)
+	}
+	if !fake.isWatched(testQuietThreadSource) {
+		t.Fatal("quiet-channel watch was not persisted")
+	}
+	assertNoPortalRefresh(t, fake, ownerDescriptors, ownerMessages, ownerControl, "quiet-channel refresh")
+
+	if err := owner.SendWithTags(map[string]string{"+dickord/channel-request": "2"}, "TAGMSG", "#discord.control"); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.SendWithTags(map[string]string{"+dickord/channel-request": "1"}, "TAGMSG", "#discord.me.chat.alice"); err != nil {
+		t.Fatal(err)
+	}
+	bridge.onErgoTagMessage(ergo, ircmsg.MakeMessage(map[string]string{
+		"account": "owner", "batch": "history", "+dickord/channel-request": "1",
+	}, "owner!u@history", "TAGMSG", "#discord.control"))
+	assertNoPortalRefresh(t, fake, ownerDescriptors, ownerMessages, ownerControl, "invalid portal snapshots")
+
+	if err := owner.Privmsg("#discord.me.chat.alice", "!topic log watch"); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitText(t, fake.topics, "interactive watch command"); got != "log watch" {
+		t.Fatalf("interactive watch args=%q", got)
+	}
+	watchReply := waitText(t, fake.watchReplies, "interactive watch acknowledgement")
+	if watchReply != "History watch/replay is already enabled for this channel" {
+		t.Fatalf("interactive watch acknowledgement=%q", watchReply)
+	}
+	select {
+	case msg := <-ownerMessages:
+		if (msg.Command != "PRIVMSG" && msg.Command != "NOTICE") ||
+			len(msg.Params) < 2 || msg.Params[1] != watchReply {
+			t.Fatalf("interactive watch reply was not relayed visibly: %+v", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("interactive watch acknowledgement was not relayed")
+	}
+
 	threadMaxNameLength := channelLength(ergo.ISupport(), cfg.Channels.MaxNameLength)
 	threadDestination := destinationName(
 		aliasedSource(testThreadSource, cfg.Channels.Aliases),
@@ -235,8 +334,13 @@ func TestErgoIntegration(t *testing.T) {
 		t.Fatalf("dynamic thread did not exercise alias truncation: %q", threadDestination)
 	}
 	fake.SendDynamicChannel(testThreadSource, testThreadChannelJSON)
-	waitChannelMetadataUpdate(t, ownerMetadata, threadDestination, testThreadChannelJSON)
-	waitChannelMetadataJSON(t, owner, ownerMetadata, threadDestination, testThreadChannelJSON)
+	waitChannelDescriptors(t, ownerDescriptors, map[string]string{threadDestination: testThreadChannelJSON})
+	if got := waitText(t, fake.topics, "dynamic thread watch"); got != "log watch-silent" {
+		t.Fatalf("dynamic thread watch args=%q", got)
+	}
+	if !fake.isWatched(testThreadSource) {
+		t.Fatal("dynamic thread watch was not persisted")
+	}
 
 	waitChannelAvatar(t, owner, ownerMetadata, "#discord.friends.general", testGuildIconURL, true)
 	updatedGuildIconURL := strings.Replace(testGuildIconURL, "abcdef", "fedcba", 1)
@@ -247,6 +351,7 @@ func TestErgoIntegration(t *testing.T) {
 
 	assertRelayedAvatar := func(msg ircmsg.Message, description string) {
 		t.Helper()
+		assertChannelDescriptor(msg, description)
 		if msg.Nick() != "Alice/discord" {
 			t.Fatalf("%s source=%q, want Alice/discord", description, msg.Nick())
 		}
@@ -788,8 +893,15 @@ func TestErgoIntegration(t *testing.T) {
 		t.Fatalf("topic args=%q", got)
 	}
 
-	mallory, _, _, _ := connectTestUser(t, port, certPool, "mallory", "mallorypass", "#discord.me.chat.alice", true)
+	mallory, _, _, _, _, _ := connectTestUser(
+		t, port, certPool, "mallory", "mallorypass", "#discord.control", true,
+		"#discord.me.chat.alice",
+	)
 	defer mallory.Quit()
+	if err := mallory.SendWithTags(map[string]string{"+dickord/channel-request": "1"}, "TAGMSG", "#discord.control"); err != nil {
+		t.Fatal(err)
+	}
+	assertNoPortalRefresh(t, fake, ownerDescriptors, ownerMessages, nil, "unauthorized portal snapshot")
 	if err := mallory.Privmsg("#discord.me.chat.alice", "must not pass"); err != nil {
 		t.Fatal(err)
 	}
@@ -832,24 +944,205 @@ fallback:
 			if present, avatar := msg.GetTag("+dickord/avatar"); present {
 				t.Fatalf("text-prefix fallback leaked avatar tag %q", avatar)
 			}
+			if present, descriptor := msg.GetTag("+dickord/channel"); present {
+				t.Fatalf("text-prefix fallback leaked channel descriptor %q", descriptor)
+			}
 			break fallback
 		case <-time.After(3 * time.Second):
 			t.Fatal("text-prefix fallback timed out")
 		}
 	}
 
-	runDocker(t, "stop", testErgoName(t))
+	runDocker(t, "stop", ergoName)
 	waitSignal(t, fake.disconnected, "rdircd disconnect after Ergo loss")
-	runDocker(t, "start", testErgoName(t))
+	runDocker(t, "start", ergoName)
 	waitSignal(t, fake.accepted, "rdircd reconnect after Ergo recovery")
 }
 
-func startTestErgo(t *testing.T, dir, filehostURL string) (*x509.CertPool, int) {
+func TestSojuPortalIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	image := strings.TrimSpace(os.Getenv("DICKORD_SOJU_TEST_IMAGE"))
+	if image == "" {
+		t.Skip("DICKORD_SOJU_TEST_IMAGE is not set; a pinned Soju v0.10.1 test image is required")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker unavailable")
+	}
+
+	const (
+		selectedSource      = "#friends.general"
+		selectedDestination = "#discord.friends.general"
+		changedGuildIconURL = "https://cdn.discordapp.com/icons/" + testGuildID + "/fedcba.png?size=256"
+		changedGuildJSON    = `{"v":1,"guild_id":"` + testGuildID + `","guild_name":"Friends; Guild","channel_id":"` + testGuildChannelID + `","channel_type":0,"parent_id":null,"channel_name":"release.notes_21 🔔","guild_icon_url":"` + changedGuildIconURL + `"}`
+	)
+
+	temp := t.TempDir()
+	ergoPlainPort := freePort(t)
+	certPool, ergoPort, _ := startTestErgo(t, temp, "https://filehost.invalid/upload", ergoPlainPort)
+	registerTestAccount(t, ergoPort, certPool, "Dickord", "bridgepass")
+	registerTestAccount(t, ergoPort, certPool, "owner", "ownerpass")
+
+	fake := newFakeRDirCD(t)
+	defer fake.Close()
+	cfg := RuntimeConfig{
+		Config: Config{
+			Ergo: ErgoConfig{
+				Address:       fmt.Sprintf("127.0.0.1:%d", ergoPort),
+				TLSServerName: "ergo.test",
+				Nick:          "Dickord",
+				Account:       "Dickord",
+				OperName:      "Dickord",
+				OwnerAccounts: []string{"owner"},
+			},
+			RDirCD: RDirCDConfig{Address: fake.Address(), Nick: "dickord"},
+			Channels: ChannelConfig{
+				Prefix:           "discord.",
+				DMIncludePattern: "me.*",
+				GuildInclude:     []string{"friends.general", "friends.thread.*"},
+				CatchUp:          true,
+				CatchUpLimit:     300,
+				MaxNameLength:    64,
+			},
+			Reconnect: ReconnectConfig{Minimum: 100 * time.Millisecond, Maximum: time.Second},
+		},
+		ErgoPassword:     "bridgepass",
+		OperPassword:     "operpass",
+		ErgoRootCAs:      certPool,
+		OwnerAccountsSet: map[string]struct{}{"owner": {}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	bridge := newBridge(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	bridgeDone := make(chan error, 1)
+	go func() { bridgeDone <- bridge.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-bridgeDone:
+			if err != nil {
+				t.Errorf("bridge shutdown: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("bridge did not stop")
+		}
+	}()
+
+	waitSignal(t, fake.accepted, "initial rdircd connection")
+	waitSignal(t, fake.lists, "initial rdircd LIST")
+	waitSignal(t, fake.listed, "initial rdircd LIST completion")
+	waitSignal(t, fake.joined, "bridge joining fake rdircd channel")
+	if got := waitText(t, fake.control, "initial history limit configuration"); got !=
+		"set -s discord-msg-history-fetch-limit 300" {
+		t.Fatalf("initial rdircd control command=%q", got)
+	}
+	for range 2 {
+		if got := waitText(t, fake.topics, "automatic watch command"); got != "log watch-silent" {
+			t.Fatalf("automatic watch args=%q", got)
+		}
+	}
+	waitCachedDescriptors(t, bridge, map[string]string{
+		"#me.chat.alice":   testDMChannelJSON,
+		"#friends.general": testGuildChannelJSON,
+	})
+
+	sojuPort := freePort(t)
+	adminSocket := filepath.Join(temp, "admin.sock")
+	sojuConfig := filepath.Join(temp, "soju.config")
+	writeTestFile(t, sojuConfig, []byte(fmt.Sprintf(`hostname localhost
+db sqlite3 %s
+message-store db
+listen irc+insecure://127.0.0.1:%d
+listen unix+admin://%s
+`, filepath.Join(temp, "soju.db"), sojuPort, adminSocket)), 0o600)
+	sojuName := testContainerName(t, "soju")
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", sojuName).Run() })
+	runDocker(t, "run", "-d", "--name", sojuName, "--network", "host",
+		"-v", temp+":"+temp, "--entrypoint", "/usr/local/bin/soju",
+		image, "-config", sojuConfig)
+	waitTestSoju(t, sojuName, sojuPort, adminSocket)
+	runDocker(t, "exec", sojuName, "/usr/local/bin/sojuctl", "-config", sojuConfig,
+		"user", "create", "-username", "portal", "-password", "portalpass", "-admin")
+	runDocker(t, "exec", sojuName, "/usr/local/bin/sojuctl", "-config", sojuConfig,
+		"user", "run", "portal", "network", "create",
+		"-addr", fmt.Sprintf("irc+insecure://127.0.0.1:%d", ergoPlainPort),
+		"-name", "bridge",
+		"-nick", "portalowner",
+		"-username", "owner",
+		"-connect-command", "PRIVMSG NickServ :IDENTIFY owner ownerpass",
+		"-connect-command", "JOIN #discord.control,"+selectedDestination,
+		"-enabled=true")
+	waitTestSojuNetwork(t, sojuName, sojuConfig)
+
+	first := connectTestSoju(t, sojuPort)
+	waitJoinedChannels(t, first.joins, "#discord.control", selectedDestination)
+	synchronizeTestIRC(t, first.conn)
+	drainIRCMessages(first.descriptors)
+	drainIRCMessages(first.visible)
+	synchronizeRDirCD(t, bridge, fake)
+	releaseList := fake.holdNextList()
+	if err := first.conn.SendWithTags(map[string]string{"+dickord/channel-request": "1"}, "TAGMSG", "#discord.control"); err != nil {
+		t.Fatal(err)
+	}
+	waitSignal(t, fake.lists, "Soju portal snapshot LIST")
+	waitExactChannelDescriptor(t, first.descriptors, selectedDestination, testGuildChannelJSON)
+	releaseList()
+	waitSignal(t, fake.listed, "Soju portal snapshot LIST completion")
+	assertNoSojuPortalTraffic(t, fake, first.visible, "initial Soju portal snapshot")
+
+	first.conn.Quit()
+	waitSignal(t, first.disconnected, "first Soju downstream disconnect")
+	fake.setListChannel(fakeRDirCDChannel{
+		source: selectedSource, topic: "Renamed guild channel",
+		descriptor: changedGuildJSON, icon: changedGuildIconURL,
+	})
+
+	second := connectTestSoju(t, sojuPort)
+	defer second.conn.Quit()
+	waitJoinedChannels(t, second.joins, "#discord.control", selectedDestination)
+	synchronizeTestIRC(t, second.conn)
+	drainIRCMessages(second.descriptors)
+	drainIRCMessages(second.visible)
+	if err := second.conn.SendWithTags(map[string]string{"+dickord/channel-request": "1"}, "TAGMSG", "#discord.control"); err != nil {
+		t.Fatal(err)
+	}
+	waitSignal(t, fake.lists, "descriptor-change refresh LIST")
+	waitSignal(t, fake.listed, "descriptor-change refresh LIST completion")
+	waitExactChannelDescriptor(t, second.descriptors, selectedDestination, changedGuildJSON)
+	assertNoSojuPortalTraffic(t, fake, second.visible, "descriptor-change refresh")
+
+	fake.setListChannel(fakeRDirCDChannel{
+		source: testQuietThreadSource, topic: "Quiet thread",
+		descriptor: testQuietThreadJSON, icon: testGuildIconURL,
+	})
+	synchronizeTestIRC(t, second.conn)
+	drainIRCMessages(second.descriptors)
+	drainIRCMessages(second.visible)
+	if err := second.conn.SendWithTags(map[string]string{"+dickord/channel-request": "1"}, "TAGMSG", "#discord.control"); err != nil {
+		t.Fatal(err)
+	}
+	waitSignal(t, fake.lists, "new-source refresh LIST")
+	waitSignal(t, fake.listed, "new-source refresh LIST completion")
+	waitExactChannelDescriptor(t, second.descriptors, "#discord.friends.thread.quiet", testQuietThreadJSON)
+	if got := waitText(t, fake.topics, "new-source silent watch"); got != "log watch-silent" {
+		t.Fatalf("new-source watch args=%q", got)
+	}
+	if !fake.isWatched(testQuietThreadSource) {
+		t.Fatal("new-source silent watch was not persisted")
+	}
+	assertNoSojuPortalTraffic(t, fake, second.visible, "new-source refresh")
+}
+
+func startTestErgo(t *testing.T, dir, filehostURL string, plaintextPort int) (*x509.CertPool, int, string) {
 	t.Helper()
 	port := freePort(t)
 	certPEM, keyPEM := testCertificate(t)
 	writeTestFile(t, filepath.Join(dir, "fullchain.pem"), certPEM, 0o600)
 	writeTestFile(t, filepath.Join(dir, "privkey.pem"), keyPEM, 0o600)
+	plaintextListener := ""
+	if plaintextPort != 0 {
+		plaintextListener = fmt.Sprintf("        \"127.0.0.1:%d\":\n", plaintextPort)
+	}
 	config := fmt.Sprintf(`
 network:
     name: DickordTest
@@ -863,7 +1156,7 @@ server:
                 cert: fullchain.pem
                 key: privkey.pem
             min-tls-version: 1.2
-    sts:
+%s    sts:
         enabled: false
     casemapping: precis
     enforce-utf8: true
@@ -951,11 +1244,10 @@ logging:
         method: stderr
         type: "* -userinput -useroutput"
         level: info
-`, filehostURL, port, integrationOperHash)
+`, filehostURL, port, plaintextListener, integrationOperHash)
 	writeTestFile(t, filepath.Join(dir, "ircd.yaml"), []byte(config), 0o600)
 
-	name := testErgoName(t)
-	runDocker(t, "rm", "-f", name)
+	name := testContainerName(t, "ergo")
 	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", name).Run() })
 	runDocker(t, "run", "-d", "--name", name, "--network", "host", "-v", dir+":/ircd", "ghcr.io/ergochat/ergo:v2.19.1")
 
@@ -968,13 +1260,13 @@ logging:
 		conn, err := tls.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port), &tls.Config{RootCAs: pool, ServerName: "ergo.test"})
 		if err == nil {
 			conn.Close()
-			return pool, port
+			return pool, port, name
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	logs, _ := exec.Command("docker", "logs", name).CombinedOutput()
 	t.Fatalf("Ergo did not start:\n%s", logs)
-	return nil, 0
+	return nil, 0, name
 }
 
 func registerTestAccount(t *testing.T, port int, roots *x509.CertPool, account, password string) {
@@ -1008,11 +1300,13 @@ func registerTestAccount(t *testing.T, port int, roots *x509.CertPool, account, 
 	conn.Quit()
 }
 
-func connectTestUser(t *testing.T, port int, roots *x509.CertPool, account, password, channel string, joinOnConnect bool) (*ircevent.Connection, <-chan ircmsg.Message, <-chan struct{}, <-chan ircmsg.Message) {
+func connectTestUser(t *testing.T, port int, roots *x509.CertPool, account, password, channel string, joinOnConnect bool, extraChannels ...string) (*ircevent.Connection, <-chan ircmsg.Message, <-chan struct{}, <-chan ircmsg.Message, <-chan ircmsg.Message, <-chan ircmsg.Message) {
 	t.Helper()
 	joined := make(chan struct{}, 1)
 	messages := make(chan ircmsg.Message, 8)
 	metadata := make(chan ircmsg.Message, 32)
+	descriptors := make(chan ircmsg.Message, 32)
+	control := make(chan ircmsg.Message, 8)
 	conn := &ircevent.Connection{
 		Server:       fmt.Sprintf("127.0.0.1:%d", port),
 		Nick:         account,
@@ -1026,7 +1320,12 @@ func connectTestUser(t *testing.T, port int, roots *x509.CertPool, account, pass
 		Log:          silentLogger(),
 	}
 	if joinOnConnect {
-		conn.AddConnectCallback(func(ircmsg.Message) { _ = conn.Join(channel) })
+		conn.AddConnectCallback(func(ircmsg.Message) {
+			_ = conn.Join(channel)
+			for _, extra := range extraChannels {
+				_ = conn.Join(extra)
+			}
+		})
 	}
 	conn.AddCallback("JOIN", func(msg ircmsg.Message) {
 		if msg.Nick() == conn.CurrentNick() && len(msg.Params) > 0 && ircCasefold(msg.Params[0]) == ircCasefold(channel) {
@@ -1037,7 +1336,20 @@ func connectTestUser(t *testing.T, port int, roots *x509.CertPool, account, pass
 		}
 	})
 	handleMessage := func(msg ircmsg.Message) {
-		if len(msg.Params) > 0 && ircCasefold(msg.Params[0]) == ircCasefold(channel) {
+		if len(msg.Params) == 0 {
+			return
+		}
+		target := ircCasefold(msg.Params[0])
+		if msg.Command == "TAGMSG" {
+			if present, _ := msg.GetTag("+dickord/channel"); present {
+				descriptors <- msg
+				return
+			}
+		}
+		if target == "#discord.control" {
+			control <- msg
+		}
+		if target == ircCasefold(channel) {
 			messages <- msg
 		}
 	}
@@ -1047,7 +1359,6 @@ func connectTestUser(t *testing.T, port int, roots *x509.CertPool, account, pass
 	conn.AddCallback("REDACT", handleMessage)
 	conn.AddCallback("761", func(msg ircmsg.Message) { metadata <- msg })
 	conn.AddCallback("766", func(msg ircmsg.Message) { metadata <- msg })
-	conn.AddCallback("770", func(msg ircmsg.Message) { metadata <- msg })
 	if err := conn.Connect(); err != nil {
 		t.Fatalf("connect %s: %v", account, err)
 	}
@@ -1055,7 +1366,249 @@ func connectTestUser(t *testing.T, port int, roots *x509.CertPool, account, pass
 	if joinOnConnect {
 		waitSignal(t, joined, account+" joining "+channel)
 	}
-	return conn, messages, joined, metadata
+	return conn, messages, joined, metadata, descriptors, control
+}
+
+type testSojuClient struct {
+	conn         *ircevent.Connection
+	descriptors  chan ircmsg.Message
+	visible      chan ircmsg.Message
+	joins        chan string
+	disconnected chan struct{}
+}
+
+func connectTestSoju(t *testing.T, port int) *testSojuClient {
+	t.Helper()
+	client := &testSojuClient{
+		descriptors:  make(chan ircmsg.Message, 64),
+		visible:      make(chan ircmsg.Message, 16),
+		joins:        make(chan string, 64),
+		disconnected: make(chan struct{}, 1),
+	}
+	conn := &ircevent.Connection{
+		Server:        fmt.Sprintf("127.0.0.1:%d", port),
+		Nick:          "portalclient",
+		User:          "portal",
+		SASLLogin:     "portal/bridge",
+		SASLPassword:  "portalpass",
+		RequestCaps:   []string{"message-tags"},
+		Timeout:       5 * time.Second,
+		ReconnectFreq: time.Hour,
+		Log:           silentLogger(),
+	}
+	client.conn = conn
+	conn.AddCallback("JOIN", func(msg ircmsg.Message) {
+		if len(msg.Params) > 0 && ircCasefold(msg.Nick()) == ircCasefold(conn.CurrentNick()) {
+			client.joins <- msg.Params[0]
+		}
+	})
+	handleMessage := func(msg ircmsg.Message) {
+		if len(msg.Params) == 0 {
+			return
+		}
+		if msg.Command == "TAGMSG" {
+			if present, _ := msg.GetTag("+dickord/channel"); present {
+				client.descriptors <- msg
+				return
+			}
+		}
+		target := ircCasefold(msg.Params[0])
+		if strings.HasPrefix(target, "#discord.") &&
+			(msg.Command == "PRIVMSG" || msg.Command == "NOTICE") {
+			client.visible <- msg
+		}
+	}
+	conn.AddCallback("PRIVMSG", handleMessage)
+	conn.AddCallback("NOTICE", handleMessage)
+	conn.AddCallback("TAGMSG", handleMessage)
+	conn.AddDisconnectCallback(func(ircmsg.Message) {
+		select {
+		case client.disconnected <- struct{}{}:
+		default:
+		}
+	})
+	if err := conn.Connect(); err != nil {
+		t.Fatalf("connect Soju downstream: %v", err)
+	}
+	if _, ok := conn.AcknowledgedCaps()["message-tags"]; !ok {
+		t.Fatal("Soju downstream did not negotiate message-tags")
+	}
+	go conn.Loop()
+	return client
+}
+
+func waitJoinedChannels(t *testing.T, joins <-chan string, channels ...string) {
+	t.Helper()
+	remaining := make(map[string]bool, len(channels))
+	for _, channel := range channels {
+		remaining[ircCasefold(channel)] = true
+	}
+	deadline := time.After(15 * time.Second)
+	for len(remaining) > 0 {
+		select {
+		case channel := <-joins:
+			delete(remaining, ircCasefold(channel))
+		case <-deadline:
+			t.Fatalf("timed out waiting for Soju channels: %v", remaining)
+		}
+	}
+}
+
+func synchronizeTestIRC(t *testing.T, conn *ircevent.Connection) {
+	t.Helper()
+	token := fmt.Sprintf("dickord-%d", time.Now().UnixNano())
+	pong := make(chan struct{}, 1)
+	callback := conn.AddCallback("PONG", func(msg ircmsg.Message) {
+		for _, param := range msg.Params {
+			if param == token {
+				select {
+				case pong <- struct{}{}:
+				default:
+				}
+				return
+			}
+		}
+	})
+	defer conn.RemoveCallback(callback)
+	if err := conn.Send("PING", token); err != nil {
+		t.Fatal(err)
+	}
+	waitSignal(t, pong, "Soju downstream synchronization")
+}
+
+func drainIRCMessages(messages <-chan ircmsg.Message) {
+	for {
+		select {
+		case <-messages:
+		default:
+			return
+		}
+	}
+}
+func synchronizeRDirCD(t *testing.T, bridge *Bridge, fake *fakeRDirCD) {
+	t.Helper()
+	bridge.mu.RLock()
+	conn := bridge.rdircd
+	bridge.mu.RUnlock()
+	if conn == nil {
+		t.Fatal("rdircd connection unavailable")
+	}
+	synchronizeTestIRC(t, conn)
+	drainStrings(fake.topics)
+	drainStrings(fake.watchReplies)
+}
+
+func drainStrings(values <-chan string) {
+	for {
+		select {
+		case <-values:
+		default:
+			return
+		}
+	}
+}
+
+func waitExactChannelDescriptor(t *testing.T, messages <-chan ircmsg.Message, channel, want string) {
+	t.Helper()
+	var last string
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case msg := <-messages:
+			if msg.Command != "TAGMSG" || len(msg.Params) != 1 {
+				t.Fatalf("unexpected Soju descriptor seed: %+v", msg)
+			}
+			if ircCasefold(msg.Params[0]) != ircCasefold(channel) {
+				continue
+			}
+			if msg.Nick() != "Dickord" {
+				t.Fatalf("Soju descriptor seed source=%q, want Dickord", msg.Nick())
+			}
+			if present, relay := msg.GetTag("draft/relaymsg"); present {
+				t.Fatalf("Soju descriptor seed was synthesized as relay traffic: %q", relay)
+			}
+			present, descriptor := msg.GetTag("+dickord/channel")
+			if !present {
+				t.Fatalf("Soju descriptor seed omitted +dickord/channel: %+v", msg)
+			}
+			last = descriptor
+			if descriptor == want {
+				if !json.Valid([]byte(descriptor)) {
+					t.Fatalf("Soju descriptor is invalid JSON: %q", descriptor)
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for descriptor on %s: last=%q want=%q", channel, last, want)
+		}
+	}
+}
+
+func waitTestSoju(t *testing.T, name string, port int, adminSocket string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		info, socketErr := os.Stat(adminSocket)
+		socketReady := socketErr == nil && info.Mode()&os.ModeSocket != 0
+		conn, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+		}
+		if socketReady && dialErr == nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	logs, _ := exec.Command("docker", "logs", name).CombinedOutput()
+	t.Fatalf("Soju did not start:\n%s", logs)
+}
+
+func waitTestSojuNetwork(t *testing.T, name, config string) {
+	t.Helper()
+	var status []byte
+	var err error
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err = exec.Command("docker", "exec", name,
+			"/usr/local/bin/sojuctl", "-config", config,
+			"user", "run", "portal", "network", "status").CombinedOutput()
+		if err == nil && strings.Contains(string(status), "[connected]") {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	logs, _ := exec.Command("docker", "logs", name).CombinedOutput()
+	t.Fatalf("Soju upstream did not connect: %v\nstatus: %s\nlogs:\n%s", err, status, logs)
+}
+
+func assertNoSojuPortalTraffic(t *testing.T, fake *fakeRDirCD, visible <-chan ircmsg.Message, description string) {
+	t.Helper()
+	select {
+	case msg := <-visible:
+		t.Fatalf("%s emitted visible IRC traffic: %+v", description, msg)
+	case command := <-fake.control:
+		t.Fatalf("%s rewrote rdircd configuration: %q", description, command)
+	case topic := <-fake.topics:
+		t.Fatalf("%s issued an unexpected watch command: %q", description, topic)
+	case reply := <-fake.watchReplies:
+		t.Fatalf("%s emitted watch chatter: %q", description, reply)
+	case outbound := <-fake.outbound:
+		t.Fatalf("%s sent Discord chat traffic: %+v", description, outbound)
+	case state := <-fake.typing:
+		t.Fatalf("%s sent Discord typing traffic: %q", description, state)
+	case reaction := <-fake.reactions:
+		t.Fatalf("%s sent Discord reaction traffic: %+v", description, reaction)
+	case redaction := <-fake.redactions:
+		t.Fatalf("%s sent Discord redaction traffic: %q", description, redaction)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+type fakeRDirCDChannel struct {
+	source     string
+	topic      string
+	descriptor string
+	icon       string
 }
 
 type fakeRDirCD struct {
@@ -1064,12 +1617,19 @@ type fakeRDirCD struct {
 	mu           sync.Mutex
 	current      net.Conn
 	writer       *bufio.Writer
+	channels     []fakeRDirCDChannel
+	watched      map[string]bool
+	nextListGate chan struct{}
 	accepted     chan struct{}
 	joined       chan struct{}
+	lists        chan struct{}
+	listed       chan struct{}
 	disconnected chan struct{}
 	outbound     chan capturedOutbound
 	typing       chan string
 	topics       chan string
+	control      chan string
+	watchReplies chan string
 	reactions    chan capturedReaction
 	redactions   chan string
 	closed       chan struct{}
@@ -1082,14 +1642,23 @@ func newFakeRDirCD(t *testing.T) *fakeRDirCD {
 		t.Fatal(err)
 	}
 	f := &fakeRDirCD{
-		t:            t,
-		listener:     listener,
+		t:        t,
+		listener: listener,
+		channels: []fakeRDirCDChannel{
+			{"#me.chat.alice", "DM", testDMChannelJSON, ""},
+			{"#friends.general", "Guild", testGuildChannelJSON, testGuildIconURL},
+		},
+		watched:      make(map[string]bool),
 		accepted:     make(chan struct{}, 8),
 		joined:       make(chan struct{}, 8),
+		lists:        make(chan struct{}, 8),
+		listed:       make(chan struct{}, 8),
 		disconnected: make(chan struct{}, 8),
 		outbound:     make(chan capturedOutbound, 16),
 		typing:       make(chan string, 8),
 		topics:       make(chan string, 8),
+		control:      make(chan string, 8),
+		watchReplies: make(chan string, 8),
 		reactions:    make(chan capturedReaction, 8),
 		redactions:   make(chan string, 8),
 		closed:       make(chan struct{}),
@@ -1110,6 +1679,53 @@ func (f *fakeRDirCD) Close() {
 	f.mu.Unlock()
 }
 
+func (f *fakeRDirCD) setListChannel(channel fakeRDirCDChannel) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for index := range f.channels {
+		if ircCasefold(f.channels[index].source) == ircCasefold(channel.source) {
+			f.channels[index] = channel
+			return
+		}
+	}
+	f.channels = append(f.channels, channel)
+}
+
+func (f *fakeRDirCD) channel(source string) (fakeRDirCDChannel, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, channel := range f.channels {
+		if ircCasefold(channel.source) == ircCasefold(source) {
+			return channel, true
+		}
+	}
+	return fakeRDirCDChannel{}, false
+}
+
+func (f *fakeRDirCD) holdNextList() func() {
+	gate := make(chan struct{})
+	f.mu.Lock()
+	f.nextListGate = gate
+	f.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { close(gate) }) }
+}
+
+func (f *fakeRDirCD) isWatched(source string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.watched[ircCasefold(source)]
+}
+
+func (f *fakeRDirCD) markWatched(source string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := ircCasefold(source)
+	already := f.watched[key]
+	f.watched[key] = true
+	return already
+}
+
 func (f *fakeRDirCD) SendDiscord(text string) {
 	f.SendDiscordID(testDiscordMessageID, text)
 }
@@ -1128,7 +1744,7 @@ func (f *fakeRDirCD) SendGuildIcon(channel, icon string) {
 	f.send(tag + " :core!core@discord TAGMSG " + channel)
 }
 
-func (f *fakeRDirCD) SendChannelMetadata(channel, descriptor, icon string) {
+func (f *fakeRDirCD) SendChannelDescriptor(channel, descriptor, icon string) {
 	descriptor = strings.NewReplacer(
 		`\`, `\\`, `;`, `\:`, " ", `\s`, "\r", `\r`, "\n", `\n`,
 	).Replace(descriptor)
@@ -1141,7 +1757,7 @@ func (f *fakeRDirCD) SendChannelMetadata(channel, descriptor, icon string) {
 
 func (f *fakeRDirCD) SendDynamicChannel(channel, descriptor string) {
 	f.send(":dickord!u@fake JOIN " + channel)
-	f.SendChannelMetadata(channel, descriptor, "")
+	f.SendChannelDescriptor(channel, descriptor, "")
 }
 
 func (f *fakeRDirCD) SendDiscordReply(messageID, replyMessageID, text string) {
@@ -1256,24 +1872,43 @@ func (f *fakeRDirCD) handle(conn net.Conn) {
 		case strings.HasPrefix(upper, "CAP END"):
 			capDone = true
 			welcome()
+		case strings.HasPrefix(upper, "PING "):
+			token := strings.TrimPrefix(strings.SplitN(line, " ", 2)[1], ":")
+			f.sendTo(conn, ":fake PONG fake :"+token)
 		case strings.HasPrefix(upper, "NICK "):
 			nick = strings.TrimSpace(line[5:])
 		case strings.HasPrefix(upper, "USER "):
 			user = true
 			welcome()
 		case upper == "LIST":
-			f.sendTo(conn, fmt.Sprintf(":fake 322 %s #me.chat.alice 1 :DM", nick))
-			f.sendTo(conn, fmt.Sprintf(":fake 322 %s #friends.general 1 :Guild", nick))
+			f.lists <- struct{}{}
+			f.mu.Lock()
+			channels := append([]fakeRDirCDChannel(nil), f.channels...)
+			gate := f.nextListGate
+			f.nextListGate = nil
+			f.mu.Unlock()
+			if gate != nil {
+				select {
+				case <-gate:
+				case <-f.closed:
+					return
+				}
+			}
+			for _, channel := range channels {
+				topic := channel.topic
+				if f.isWatched(channel.source) {
+					topic = "<W> " + topic
+				}
+				f.sendTo(conn, fmt.Sprintf(":fake 322 %s %s 1 :%s", nick, channel.source, topic))
+			}
 			f.sendTo(conn, fmt.Sprintf(":fake 323 %s :end", nick))
+			f.listed <- struct{}{}
 		case strings.HasPrefix(upper, "JOIN "):
 			channel := strings.TrimSpace(line[5:])
 			f.sendTo(conn, fmt.Sprintf(":%s!u@fake JOIN %s", nick, channel))
 			f.sendTo(conn, fmt.Sprintf(":fake 366 %s %s :end", nick, channel))
-			switch ircCasefold(channel) {
-			case "#me.chat.alice":
-				f.SendChannelMetadata(channel, testDMChannelJSON, "")
-			case "#friends.general":
-				f.SendChannelMetadata(channel, testGuildChannelJSON, testGuildIconURL)
+			if info, ok := f.channel(channel); ok {
+				f.SendChannelDescriptor(channel, info.descriptor, info.icon)
 			}
 			if ircCasefold(channel) == "#me.chat.alice" {
 				select {
@@ -1291,12 +1926,28 @@ func (f *fakeRDirCD) handle(conn net.Conn) {
 			if ergoMsgID := tags["+dickord/ergo-msgid"]; ergoMsgID != "" {
 				f.sendTo(conn, "@+dickord/discord-msgid="+testOutboundDiscordMessageID+";+reply="+ergoMsgID+" :fake TAGMSG #me.chat.alice")
 			}
-		case strings.HasPrefix(upper, "TOPIC #ME.CHAT.ALICE") || strings.HasPrefix(upper, "TOPIC #FRIENDS.GENERAL"):
-			args := ""
+		case strings.HasPrefix(upper, "PRIVMSG #RDIRCD.CONTROL "):
+			text := strings.TrimPrefix(strings.SplitN(line, " ", 3)[2], ":")
+			f.control <- text
+			f.sendTo(conn, ":core!core@discord PRIVMSG #rdircd.control :Updated conf value: "+text)
+		case strings.HasPrefix(upper, "TOPIC #"):
+			fields := strings.Fields(line)
+			channel, args := fields[1], ""
 			if index := strings.Index(line, " :"); index >= 0 {
 				args = line[index+2:]
 			}
 			f.topics <- args
+			if args == "log watch" || args == "log watch-silent" {
+				already := f.markWatched(channel)
+				if args == "log watch" {
+					reply := "History watch/replay enabled for this channel"
+					if already {
+						reply = "History watch/replay is already enabled for this channel"
+					}
+					f.watchReplies <- reply
+					f.sendTo(conn, ":core!core@discord NOTICE "+channel+" :"+reply)
+				}
+			}
 		case strings.HasPrefix(upper, "QUIT"):
 			return
 		}
@@ -1373,8 +2024,13 @@ func runDocker(t *testing.T, args ...string) {
 	}
 }
 
-func testErgoName(t *testing.T) string {
-	return "dickord-integration-" + strings.NewReplacer("/", "-", "_", "-").Replace(t.Name())
+func testContainerName(t *testing.T, role string) string {
+	t.Helper()
+	var suffix [6]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("dickord-integration-%s-%x", role, suffix)
 }
 
 func waitSignal(t *testing.T, signal <-chan struct{}, description string) {
@@ -1397,72 +2053,90 @@ func waitText(t *testing.T, values <-chan string, description string) string {
 	}
 }
 
-func waitChannelMetadataJSON(t *testing.T, conn *ircevent.Connection, replies <-chan ircmsg.Message, channel, want string) {
+func waitCachedDescriptors(t *testing.T, bridge *Bridge, want map[string]string) {
 	t.Helper()
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
-		if err := conn.Send("METADATA", channel, "GET", "dickord/channel"); err != nil {
-			t.Fatal(err)
+		bridge.mu.RLock()
+		match := len(bridge.descriptors) == len(want)
+		for source, descriptor := range want {
+			match = match && bridge.descriptors[ircCasefold(source)] == descriptor
 		}
-		select {
-		case msg := <-replies:
-			if msg.Command != "761" || len(msg.Params) < 5 ||
-				ircCasefold(msg.Params[1]) != ircCasefold(channel) ||
-				msg.Params[2] != "dickord/channel" {
-				continue
-			}
-			if got := msg.Params[4]; got != want {
-				t.Fatalf("channel metadata on %s=%q, want %q", channel, got, want)
-			} else if !json.Valid([]byte(got)) {
-				t.Fatalf("channel metadata on %s is invalid JSON: %q", channel, got)
-			}
+		bridge.mu.RUnlock()
+		if match {
 			return
-		case <-time.After(100 * time.Millisecond):
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for channel metadata on %s", channel)
+	bridge.mu.RLock()
+	defer bridge.mu.RUnlock()
+	t.Fatalf("cached descriptors=%v, want %v", bridge.descriptors, want)
 }
 
-func waitMetadataSubscription(t *testing.T, replies <-chan ircmsg.Message, key string) {
+func waitChannelDescriptors(t *testing.T, messages <-chan ircmsg.Message, want map[string]string) {
 	t.Helper()
+	remaining := make(map[string]string, len(want))
+	for channel, descriptor := range want {
+		remaining[ircCasefold(channel)] = descriptor
+	}
 	deadline := time.After(8 * time.Second)
-	for {
+	for len(remaining) > 0 {
 		select {
-		case msg := <-replies:
-			if msg.Command != "770" {
-				continue
+		case msg := <-messages:
+			if msg.Command != "TAGMSG" || len(msg.Params) != 1 {
+				t.Fatalf("unexpected descriptor seed: %+v", msg)
 			}
-			for _, param := range msg.Params {
-				if param == key {
-					return
-				}
+			if msg.Nick() != "Dickord" {
+				t.Fatalf("descriptor seed source=%q, want Dickord", msg.Nick())
 			}
+			if present, relay := msg.GetTag("draft/relaymsg"); present {
+				t.Fatalf("descriptor seed was synthesized as relay traffic: %q", relay)
+			}
+			channel := ircCasefold(msg.Params[0])
+			expected, ok := remaining[channel]
+			if !ok {
+				t.Fatalf("unexpected or duplicate descriptor seed on %s: %+v", channel, msg)
+			}
+			present, descriptor := msg.GetTag("+dickord/channel")
+			if !present || descriptor != expected {
+				t.Fatalf("descriptor on %s=%q, want %q", channel, descriptor, expected)
+			}
+			if !json.Valid([]byte(descriptor)) {
+				t.Fatalf("descriptor on %s is invalid JSON: %q", channel, descriptor)
+			}
+			delete(remaining, channel)
 		case <-deadline:
-			t.Fatalf("timed out subscribing to metadata key %s", key)
+			t.Fatalf("timed out waiting for descriptors: %v", remaining)
 		}
 	}
 }
 
-func waitChannelMetadataUpdate(t *testing.T, replies <-chan ircmsg.Message, channel, want string) {
+func assertNoPortalRefresh(t *testing.T, fake *fakeRDirCD, descriptors, messages, control <-chan ircmsg.Message, description string) {
 	t.Helper()
-	deadline := time.After(8 * time.Second)
-	for {
-		select {
-		case msg := <-replies:
-			if msg.Command != "761" || len(msg.Params) < 5 ||
-				ircCasefold(msg.Params[1]) != ircCasefold(channel) ||
-				msg.Params[2] != "dickord/channel" {
-				continue
-			}
-			if got := msg.Params[4]; got != want {
-				t.Fatalf("subscribed channel metadata on %s=%q, want %q", channel, got, want)
-			} else if !json.Valid([]byte(got)) {
-				t.Fatalf("subscribed channel metadata on %s is invalid JSON: %q", channel, got)
-			}
-			return
-		case <-deadline:
-			t.Fatalf("timed out waiting for subscribed channel metadata on %s", channel)
-		}
+	select {
+	case msg := <-descriptors:
+		t.Fatalf("%s emitted descriptor: %+v", description, msg)
+	case msg := <-messages:
+		t.Fatalf("%s emitted visible chat: %+v", description, msg)
+	case msg := <-control:
+		t.Fatalf("%s emitted visible control response: %+v", description, msg)
+	case <-fake.lists:
+		t.Fatalf("%s issued another LIST", description)
+	case command := <-fake.control:
+		t.Fatalf("%s rewrote rdircd configuration: %q", description, command)
+	case topic := <-fake.topics:
+		t.Fatalf("%s changed a watch: %q", description, topic)
+	case reply := <-fake.watchReplies:
+		t.Fatalf("%s emitted watch chatter: %q", description, reply)
+	case outbound := <-fake.outbound:
+		t.Fatalf("%s sent Discord traffic: %+v", description, outbound)
+	case state := <-fake.typing:
+		t.Fatalf("%s sent Discord typing traffic: %q", description, state)
+	case reaction := <-fake.reactions:
+		t.Fatalf("%s sent Discord reaction traffic: %+v", description, reaction)
+	case redaction := <-fake.redactions:
+		t.Fatalf("%s sent Discord redaction traffic: %q", description, redaction)
+	case <-time.After(300 * time.Millisecond):
 	}
 }
 

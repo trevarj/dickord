@@ -74,12 +74,15 @@ type Bridge struct {
 	relayReady       bool
 	rdircd           *ircevent.Connection
 	rdircdReady      bool
+	rdircdRefreshing bool
 	rdircdCancel     context.CancelFunc
 	rdircdGeneration uint64
 	sourceToDest     map[string]string
 	destToSource     map[string]string
+	descriptors      map[string]string
 	watchedSources   map[string]bool
 	autoJoinPending  map[string]bool
+	ownerNicks       map[string]string
 	nextRelayNonce   uint64
 	pendingRelays    map[string]pendingRelay
 	messageRefs      map[messageRefKey]string
@@ -100,8 +103,10 @@ func newBridge(cfg RuntimeConfig, logger *slog.Logger) *Bridge {
 		uploads:          newAttachmentUploader(cfg),
 		sourceToDest:     make(map[string]string),
 		destToSource:     make(map[string]string),
+		descriptors:      make(map[string]string),
 		watchedSources:   make(map[string]bool),
 		autoJoinPending:  make(map[string]bool),
+		ownerNicks:       make(map[string]string),
 		pendingRelays:    make(map[string]pendingRelay),
 		messageRefs:      make(map[messageRefKey]string),
 		discordRefs:      make(map[string]discordMessageRef),
@@ -258,6 +263,7 @@ func (b *Bridge) onErgoDisconnected(conn *ircevent.Connection) {
 	b.ergoRegistered = false
 	b.operReady = false
 	b.relayReady = false
+	b.ownerNicks = make(map[string]string)
 	b.mu.Unlock()
 	b.stopRDirCD()
 	b.log.Warn("Ergo disconnected; rdircd leg closed")
@@ -270,6 +276,7 @@ func (b *Bridge) clearErgo(conn *ircevent.Connection) {
 		b.ergoRegistered = false
 		b.operReady = false
 		b.relayReady = false
+		b.ownerNicks = make(map[string]string)
 	}
 	b.mu.Unlock()
 	b.stopRDirCD()
@@ -294,6 +301,7 @@ func (b *Bridge) stopRDirCD() {
 	cancel := b.rdircdCancel
 	b.rdircdCancel = nil
 	b.rdircdReady = false
+	b.rdircdRefreshing = false
 	b.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -397,6 +405,8 @@ func (b *Bridge) onRDirCDRegistered(conn *ircevent.Connection) {
 	valid := b.rdircd == conn && b.ergoRegistered && b.operReady
 	if valid {
 		b.rdircdReady = false
+		b.rdircdRefreshing = false
+		b.descriptors = make(map[string]string)
 		b.watchedSources = make(map[string]bool)
 	}
 	b.mu.Unlock()
@@ -405,13 +415,16 @@ func (b *Bridge) onRDirCDRegistered(conn *ircevent.Connection) {
 		return
 	}
 	b.ensureMapping(conn, "#rdircd.control", true)
-	_ = conn.Send("LIST")
+	if err := conn.Send("LIST"); err != nil {
+		b.log.Error("failed to start rdircd channel discovery", "error", err)
+	}
 }
 
 func (b *Bridge) onRDirCDDisconnected(conn *ircevent.Connection) {
 	b.mu.Lock()
 	if b.rdircd == conn {
 		b.rdircdReady = false
+		b.rdircdRefreshing = false
 	}
 	b.mu.Unlock()
 	b.log.Warn("rdircd disconnected")
@@ -422,6 +435,7 @@ func (b *Bridge) clearRDirCD(conn *ircevent.Connection) {
 	if b.rdircd == conn {
 		b.rdircd = nil
 		b.rdircdReady = false
+		b.rdircdRefreshing = false
 	}
 	b.mu.Unlock()
 }
@@ -446,10 +460,16 @@ func (b *Bridge) onRDirCDListEntry(conn *ircevent.Connection, msg ircmsg.Message
 
 func (b *Bridge) onRDirCDListEnd(conn *ircevent.Connection) {
 	b.mu.Lock()
-	if b.rdircd != conn || !b.ergoRegistered || !b.operReady {
+	if b.rdircd != conn {
 		b.mu.Unlock()
 		return
 	}
+	b.rdircdRefreshing = false
+	if !b.ergoRegistered || !b.operReady {
+		b.mu.Unlock()
+		return
+	}
+	initial := !b.rdircdReady
 	b.rdircdReady = true
 	sources := make([]string, 0, len(b.sourceToDest))
 	for source := range b.sourceToDest {
@@ -460,9 +480,11 @@ func (b *Bridge) onRDirCDListEnd(conn *ircevent.Connection) {
 	b.mu.Unlock()
 
 	if b.cfg.Channels.CatchUp {
-		if err := conn.Privmsg("#rdircd.control", fmt.Sprintf(
-			"set -s discord-msg-history-fetch-limit %d", b.cfg.Channels.CatchUpLimit)); err != nil {
-			b.log.Error("failed to configure rdircd history limit", "error", err)
+		if initial {
+			if err := conn.Privmsg("#rdircd.control", fmt.Sprintf(
+				"set -s discord-msg-history-fetch-limit %d", b.cfg.Channels.CatchUpLimit)); err != nil {
+				b.log.Error("failed to configure rdircd history limit", "error", err)
+			}
 		}
 		for _, source := range sources {
 			b.enableWatch(conn, source)
@@ -497,7 +519,7 @@ func (b *Bridge) enableWatch(conn *ircevent.Connection, source string) {
 
 	// Upstream's control-channel watch-by-name path is broken for private
 	// channels. The channel-local TOPIC command uses the correct channel ID.
-	if err := conn.Send("TOPIC", source, "log watch"); err != nil {
+	if err := conn.Send("TOPIC", source, "log watch-silent"); err != nil {
 		b.mu.Lock()
 		delete(b.watchedSources, key)
 		b.mu.Unlock()
@@ -558,7 +580,7 @@ func (b *Bridge) onRDirCDTagMessage(conn *ircevent.Connection, msg ircmsg.Messag
 	}
 	source := msg.Params[0]
 	if present, channel := msg.GetTag("+dickord/channel"); present {
-		b.setErgoChannelMetadata(conn, source, "dickord/channel", channel)
+		b.setErgoChannelDescriptor(conn, source, channel)
 	}
 	if present, avatar := msg.GetTag("+dickord/guild-icon"); present {
 		b.setErgoChannelMetadata(conn, source, "avatar", avatar)
@@ -573,6 +595,34 @@ func (b *Bridge) onRDirCDTagMessage(conn *ircevent.Connection, msg ircmsg.Messag
 		b.cacheDiscordRefLocked(ergoMsgID, discordMessageRef{source: source, messageID: discordMsgID})
 	}
 	b.mu.Unlock()
+}
+
+func (b *Bridge) setErgoChannelDescriptor(rdircd *ircevent.Connection, source, value string) {
+	if len(value) > 2048 || len(ircmsg.EscapeTagValue(value)) > 3072 {
+		return
+	}
+	sourceKey := ircCasefold(source)
+	b.mu.Lock()
+	destination := b.sourceToDest[sourceKey]
+	if b.rdircd != rdircd || destination == "" {
+		b.mu.Unlock()
+		return
+	}
+	if value == "" {
+		delete(b.descriptors, sourceKey)
+		b.mu.Unlock()
+		return
+	}
+	b.descriptors[sourceKey] = value
+	ergo := b.ergo
+	ready := b.ergoRegistered && b.operReady
+	b.mu.Unlock()
+	if ergo == nil || !ready {
+		return
+	}
+	if err := ergo.SendWithTags(map[string]string{"+dickord/channel": value}, "TAGMSG", destination); err != nil {
+		b.log.Warn("failed to mirror channel descriptor tag", "channel", destination, "error", err)
+	}
 }
 
 func (b *Bridge) setErgoChannelMetadata(rdircd *ircevent.Connection, source, key, value string) {
@@ -671,13 +721,16 @@ func (b *Bridge) onErgoJoin(conn *ircevent.Connection, msg ircmsg.Message) {
 	}
 	for _, owner := range b.cfg.Ergo.OwnerAccounts {
 		if ircCasefold(account) == ircCasefold(owner) {
-			b.scheduleOwnerAutoJoin(conn, owner)
+			b.mu.Lock()
+			b.ownerNicks[ircCasefold(owner)] = msg.Nick()
+			b.mu.Unlock()
+			b.scheduleOwnerAutoJoin(conn, owner, msg.Nick())
 			return
 		}
 	}
 }
 
-func (b *Bridge) scheduleOwnerAutoJoin(conn *ircevent.Connection, account string) {
+func (b *Bridge) scheduleOwnerAutoJoin(conn *ircevent.Connection, account, nick string) {
 	key := ircCasefold(account)
 	b.mu.Lock()
 	if b.ergo != conn || b.autoJoinPending[key] {
@@ -700,7 +753,7 @@ func (b *Bridge) scheduleOwnerAutoJoin(conn *ircevent.Connection, account string
 		}
 		b.mu.Unlock()
 		for _, destination := range destinations {
-			if err := conn.Send("SAJOIN", account, destination); err != nil {
+			if err := conn.Send("SAJOIN", nick, destination); err != nil {
 				b.log.Warn("failed to retry owner autojoin", "account", account, "channel", destination, "error", err)
 			}
 		}
@@ -713,8 +766,17 @@ func (b *Bridge) scheduleOwnerAutoJoin(conn *ircevent.Connection, account string
 }
 
 func (b *Bridge) autoJoinOwners(conn *ircevent.Connection, destination string) {
+	b.mu.RLock()
+	nicks := make(map[string]string, len(b.cfg.Ergo.OwnerAccounts))
 	for _, account := range b.cfg.Ergo.OwnerAccounts {
-		if err := conn.Send("SAJOIN", account, destination); err != nil {
+		nicks[account] = b.ownerNicks[ircCasefold(account)]
+	}
+	b.mu.RUnlock()
+	for account, nick := range nicks {
+		if nick == "" {
+			nick = account
+		}
+		if err := conn.Send("SAJOIN", nick, destination); err != nil {
 			b.log.Warn("failed to autojoin owner", "account", account, "channel", destination, "error", err)
 		}
 	}
@@ -885,6 +947,7 @@ func (b *Bridge) relayToErgo(destination, nick, text string, notice bool, discor
 			replyMsgID = ids[0]
 		}
 	}
+	descriptor := b.descriptors[ircCasefold(discord.source)]
 	b.mu.RUnlock()
 	if conn == nil || !ready {
 		return
@@ -900,36 +963,45 @@ func (b *Bridge) relayToErgo(destination, nick, text string, notice bool, discor
 		for index, line := range splitUTF8(text, maxPayload) {
 			nonce := b.addPendingRelay(destination, nick, line, discord)
 			tags := map[string]string{"+dickord/nonce": nonce}
+			if descriptor != "" {
+				tags["+dickord/channel"] = descriptor
+			}
 			if index == 0 && replyMsgID != "" {
 				tags["+reply"] = replyMsgID
 			}
 			if avatarPresent {
 				tags["+dickord/avatar"] = avatar
 			}
-			if labeled {
-				err := conn.SendWithLabel(func(response *ircevent.Batch) {
-					if response == nil {
-						b.log.Warn("RELAYMSG response timed out; not retrying to avoid duplicates", "channel", destination)
-						return
-					}
-					if !batchHasError(response) {
-						return
-					}
-					b.removePendingRelay(nonce)
-					b.disableRelay(conn)
-					b.sendPrefixed(conn, destination, rnick, line, notice)
-				}, tags, "RELAYMSG", destination, rnick, line)
-				if err == nil {
-					continue
+			var err error
+			for {
+				if labeled {
+					err = conn.SendWithLabel(func(response *ircevent.Batch) {
+						if response == nil {
+							b.log.Warn("RELAYMSG response timed out; not retrying to avoid duplicates", "channel", destination)
+							return
+						}
+						if !batchHasError(response) {
+							return
+						}
+						b.removePendingRelay(nonce)
+						b.disableRelay(conn)
+						b.sendPrefixed(conn, destination, rnick, line, notice)
+					}, tags, "RELAYMSG", destination, rnick, line)
+				} else {
+					err = conn.SendWithTags(tags, "RELAYMSG", destination, rnick, line)
 				}
-				b.removePendingRelay(nonce)
-				b.log.Warn("labeled RELAYMSG send failed; using text prefix", "error", err, "channel", destination)
-			} else if err := conn.SendWithTags(tags, "RELAYMSG", destination, rnick, line); err == nil {
-				continue
-			} else {
-				b.removePendingRelay(nonce)
-				b.log.Warn("RELAYMSG send failed; using text prefix", "error", err, "channel", destination)
+				if err != ircmsg.ErrorTagsTooLong || tags["+dickord/channel"] == "" {
+					break
+				}
+				// The serializer checks the full client-tag budget, including the
+				// actual label, before queueing bytes. Retry only without the descriptor.
+				delete(tags, "+dickord/channel")
 			}
+			if err == nil {
+				continue
+			}
+			b.removePendingRelay(nonce)
+			b.log.Warn("RELAYMSG send failed; using text prefix", "error", err, "channel", destination)
 			b.sendPrefixed(conn, destination, rnick, line, notice)
 		}
 		return
@@ -1319,7 +1391,59 @@ func (b *Bridge) forwardErgoReactionWithRetry(conn *ircevent.Connection, destina
 	}
 }
 
+func (b *Bridge) onErgoChannelSnapshotRequest(conn *ircevent.Connection, msg ircmsg.Message) bool {
+	present, version := msg.GetTag("+dickord/channel-request")
+	if !present {
+		return false
+	}
+	if version != "1" || len(msg.Params) != 1 || isPlayback(msg) {
+		return true
+	}
+	if _, _, authorized := authorizedMessage(msg, b.cfg.OwnerAccountsSet); !authorized {
+		return true
+	}
+
+	b.mu.Lock()
+	source := b.destToSource[ircCasefold(msg.Params[0])]
+	rdircd := b.rdircd
+	ready := b.ergo == conn && b.ergoRegistered && b.operReady && b.rdircdReady && rdircd != nil
+	if !ready || ircCasefold(source) != ircCasefold("#rdircd.control") {
+		b.mu.Unlock()
+		return true
+	}
+	seeds := make(map[string]string, len(b.descriptors))
+	for source, descriptor := range b.descriptors {
+		if destination := b.sourceToDest[source]; destination != "" {
+			seeds[destination] = descriptor
+		}
+	}
+	refresh := !b.rdircdRefreshing
+	b.rdircdRefreshing = true
+	b.mu.Unlock()
+
+	for destination, descriptor := range seeds {
+		if err := conn.SendWithTags(map[string]string{"+dickord/channel": descriptor}, "TAGMSG", destination); err != nil {
+			b.log.Warn("failed to resend channel descriptor tag", "channel", destination, "error", err)
+		}
+	}
+	if !refresh {
+		return true
+	}
+	if err := rdircd.Send("LIST"); err != nil {
+		b.mu.Lock()
+		if b.rdircd == rdircd {
+			b.rdircdRefreshing = false
+		}
+		b.mu.Unlock()
+		b.log.Warn("failed to refresh rdircd channel discovery", "error", err)
+	}
+	return true
+}
+
 func (b *Bridge) onErgoTagMessage(conn *ircevent.Connection, msg ircmsg.Message) {
+	if b.onErgoChannelSnapshotRequest(conn, msg) {
+		return
+	}
 	if b.onErgoReaction(conn, msg) {
 		return
 	}

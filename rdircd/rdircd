@@ -970,14 +970,27 @@ def discord_guild_icon_url(guild):
 	if not isinstance(icon, str) or not re.fullmatch(r'(?:a_)?[0-9a-f]+', icon): return
 	return f'https://cdn.discordapp.com/icons/{gid}/{icon}.png?size=256'
 
-def discord_channel_json(cc):
+def discord_channel_json(cc, self_user_id):
 	gg = cc.gg
 	guild_id = None if str(gg.id) == '1' else str(gg.id)
-	parent_id = cc.get('parent_id')
+	parent_id, name, channel_icon_url = cc.get('parent_id'), cc.names.raw, None
+	if guild_id is None and (cc.ct == DiscordSession.c_chan_type.private or not name.strip()):
+		names = sorted( (
+			(u.get('global_name') or u.get('username') or str(uid), int(uid), u)
+			for uid, u in cc.get('users_static', dict()).items()
+			if str(uid) != str(self_user_id) ), key=lambda item: (item[0].casefold(), item[1]) )
+		if cc.ct == DiscordSession.c_chan_type.private:
+			name = names[0][0] if names else f'DM {cc.id}'
+			channel_icon_url = discord_user_avatar_url(names[0][2]) if names else None
+		else:
+			name = ', '.join(name for name, uid, user in names) or f'DM {cc.id}'
+			if len(name) > 100: name = name[:99] + '…'
 	return json.dumps(dict(
 		v=1, guild_id=guild_id, guild_name=None if guild_id is None else gg.get('name'),
 		channel_id=str(cc.id), channel_type=int(cc.ct),
-		parent_id=str(parent_id) if parent_id else None,
+		parent_id=str(parent_id) if parent_id else None, channel_name=name,
+		guild_icon_url=(discord_guild_icon_url(gg) or None) if guild_id else None,
+		channel_icon_url=channel_icon_url,
 	), ensure_ascii=False, separators=(',', ':'))
 
 def dict_update(d, du_iter=None, sync=True):
@@ -1833,11 +1846,16 @@ class IRCProtocol(asyncio.Protocol):
 		if not cm: cm = self.bridge.cmd_chan_map()
 		c = self.req_chan_info(chan, cm=cm, check=False)
 		if c is False: return self.send(403, chan, ':No such channel')
+		name = c.name if c else self.chan_name(chan)
+		if name in self.st_irc.chans:
+			ch = self.st_irc.chans[name]
+			if c: ch.cc = c.get('cc')
+			if cc := ch.get('cc'): self.cmd_channel_metadata(chan, cc, force=True)
+			return
 		elif c:
 			self.bridge.cmd_chan_map_sync_tracking(c, cm)
 			if cm.ø_online:
 				self.bridge.cmd_chan_watch_replay(self.st_irc.ts_watch, c=c, conn=self)
-		name = c.name if c else self.chan_name(chan)
 		# topic=None will always be updated on cmd_chan_list_sync
 		ch = self.st_irc.chans[name] = adict(topic=c and c.topic, cc=c and c.get('cc'))
 		self.send(f':{self.src_self()} JOIN {chan}')
@@ -2045,11 +2063,12 @@ class IRCProtocol(asyncio.Protocol):
 		self.send(f'{tags}:{self.src_discord(nick)} {msg_type} {chan} :{text}')
 		self.st_irc.typing_repeat.active.pop((nick, chan), None)
 
-	def cmd_channel_metadata(self, chan, cc, guild_icon=False):
+	def cmd_channel_metadata(self, chan, cc, guild_icon=False, force=False):
 		chan = self.chan_spec(chan)
 		if not (ch := self.st_irc.chans.get(self.chan_name(chan))): return
-		tags, channel_json = list(), discord_channel_json(cc)
-		if channel_json != ch.get('dickord_channel'):
+		tags = list()
+		channel_json = discord_channel_json(cc, self.bridge.discord.st_da.user.id)
+		if force or channel_json != ch.get('dickord_channel'):
 			tags.append(f'+dickord/channel={self.tag_escape(channel_json)}')
 			ch.dickord_channel = channel_json
 		if guild_icon and str(cc.gg.get('id')) != '1' and (
@@ -3820,10 +3839,11 @@ class DiscordSession:
 		_gg_prefix = lambda: self.discord.bridge.uid('guild', gg.id, kh=gg.get('kh'))
 		ct, chans_updated, new_threads = self.c_chan_type, dict(), list()
 		for c in force_list(chans):
-			name, topic = c.get('name'), c.get('topic') or ''
 			cc = gg.chans.get(c.id, adict(
 				tid=None, names=adict(), threads=adict(), last_msg_sent=adict(),
 				users=TimedCacheDict(self.conf._irc_names_timeout, bump_on_get=False) ))
+			name = c.get('name', cc.names.get('raw')) or ''
+			topic = c.get('topic') or ''
 			for k in 'version', 'permission_overwrites': c.pop(k, None)
 			if (c_hash := data_hash(c, c=8)) == cc.get('dedup_hash') and dedup: continue
 			cc.dedup_hash = c_hash # some bots spam no-op chan-updates, hence dedup
@@ -3856,15 +3876,18 @@ class DiscordSession:
 				cc.tid, cc.parent, cc_parent.threads[c_tid] = c_tid, cc_parent, cc
 				if not cc.names.old: new_threads.append(cc)
 			elif cc_private:
-				cc.users_static, cc.users.timeout = dict(), 2**32 # persistent list of users here
-				for n, u in enumerate(users := c.get('recipients') or list()):
-					self.discord.cmd_user_cache(gg.id, u.id, nick := self.discord.user_name(u))
-					cc.users_static[u.id], users[n] = u, (nick, None) # irc nick resolved on first use
-				cc.users_static[self.st_da.user.id] = self.st_da.user
-				dict_update(cc.users, users, sync=True)
+				cc.users.timeout = 2**32 # persistent list of users here
+				if 'recipients' in c or 'users_static' not in cc:
+					cc.users_static, users = dict(), list()
+					for u in c.get('recipients') or list():
+						self.discord.cmd_user_cache(gg.id, u.id, nick := self.discord.user_name(u))
+						cc.users_static[u.id] = u
+						users.append((nick, None)) # irc nick resolved on first use
+					cc.users_static[self.st_da.user.id] = self.st_da.user
+					dict_update(cc.users, users, sync=True)
 				name_kws = dict(
 					id=(name_hash := str_hash(c.id, 8)),
-					chat_name=(chat_name := (c.get('name') or '').strip()) )
+					chat_name=(chat_name := cc.names.raw.strip()) )
 				if any(f'{{{k}}}' in self.conf.irc_chan_private for k in ['names', 'names_or_id']):
 					# {id} hash-name is not descriptive, but should stay the same for group chats
 					# Caveat: channel names are case-insensitive, even if hash is not
@@ -3987,6 +4010,13 @@ class DiscordSession:
 		cc = self.st_da.me.chans.get(m.channel_id)
 		nick = (u := m.get('user')) and self.discord.user_name(u)
 		if u: self.discord.cmd_user_cache(1, u.id, nick)
+		if cc and u and act in ['add', 'remove']:
+			if act == 'add': cc.users_static[u.id] = u
+			else: cc.users_static.pop(u.id, None)
+			cc.pop('dedup_hash', None)
+			for conn in self.discord.bridge.irc_conns.values():
+				for name, ch in conn.st_irc.chans.items():
+					if ch.get('cc') is cc: conn.cmd_channel_metadata(name, cc)
 		self.discord.cmd_msg_recv(cc, nick, f'recipient {act.lower()}', dict(_ev=True))
 
 	def op_ev_ban(self, m, act):
@@ -4941,7 +4971,9 @@ class RDIRCD:
 							n = len(state_list) - n - nd # 1 is always pre-restart state, 0 for current run
 							notice_cmd(f'  [{n}] {k} = {ts_iso8601_ms(v)}')
 					return
-				if state in ['watch', 'unwatch']:
+				if state in ['watch', 'unwatch', 'watch-silent']:
+					silent = state == 'watch-silent'
+					if silent: state = 'watch'
 					if not (info := self.irc_discord_info(name)):
 						raise IRCBridgeSignal(f'Not a discord channel: {chan}')
 					wk, wc = self.conf.watch.get_keys(info.cc.id), state == 'watch'
@@ -4950,11 +4982,13 @@ class RDIRCD:
 						for k in (upd := dict.fromkeys(wk)): del self.conf.watch[k]
 					else:
 						wc = 'already enabled' if wc else 'not enabled'
+						if silent: return
 						return notice_cmd(f'History watch/replay is {wc} for this channel')
 					if not self.conf.misc_conf_readonly: self.conf.update_file_section('watch', upd)
 					else: notice_cmd( 'History watch/replay changes for'
 						' channel will not be stored due to read-only configuration' )
 					if wc: self.conf.state_watch(info.cc.id, time.time())
+					if silent: return
 					wc = 'enabled' if wc else 'disabled'
 					return notice_cmd(f'History watch/replay {wc} for this channel')
 				ts = None
