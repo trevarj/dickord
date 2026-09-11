@@ -1045,7 +1045,7 @@ class MessageSendTests(unittest.IsolatedAsyncioTestCase):
         response.release = lambda: response.update(released=True)
         return response
     @staticmethod
-    def opus_ogg(duration=2, pre_skip=312):
+    def opus_ogg(duration=2, pre_skip=312, eos=True):
         opus_head = (
             b"OpusHead\x01\x01"
             + pre_skip.to_bytes(2, "little")
@@ -1065,7 +1065,7 @@ class MessageSendTests(unittest.IsolatedAsyncioTestCase):
         return (
             page(0, 2, 0, opus_head)
             + page(1, 0, 0, opus_tags)
-            + page(2, 4, granule, audio)
+            + page(2, 4 if eos else 0, granule, audio)
         )
 
     class FormData:
@@ -1162,9 +1162,9 @@ class MessageSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(channel.last_msg_sent, {"flake": "old", "line": "old"})
         self.assertTrue(response.released)
 
-    async def test_automatic_ogg_upload_posts_computed_voice_multipart(self):
-        audio = self.opus_ogg(duration=2, pre_skip=312)
-        response = self.upload_response(audio, content_type="audio/ogg")
+    async def test_android_ogg_without_eos_posts_computed_voice_multipart(self):
+        audio = self.opus_ogg(duration=2, pre_skip=312, eos=False)
+        response = self.upload_response(audio, content_type="application/ogg")
         discord, channel, request = self.make_upload_discord(response)
         url = "https://files.example/voice.ogg"
 
