@@ -970,6 +970,13 @@ def discord_guild_icon_url(guild):
 	if not isinstance(icon, str) or not re.fullmatch(r'(?:a_)?[0-9a-f]+', icon): return
 	return f'https://cdn.discordapp.com/icons/{gid}/{icon}.png?size=256'
 
+def discord_channel_icon_url(channel):
+	if not channel or 'icon' not in channel or not re.fullmatch(
+			r'[0-9]+', cid := str(channel.get('id') or '') ): return
+	icon = channel.get('icon')
+	if not isinstance(icon, str) or not re.fullmatch(r'(?:a_)?[0-9a-f]+', icon): return
+	return f'https://cdn.discordapp.com/channel-icons/{cid}/{icon}.png?size=256'
+
 def discord_channel_json(cc, self_user_id):
 	gg = cc.gg
 	guild_id = None if str(gg.id) == '1' else str(gg.id)
@@ -985,6 +992,8 @@ def discord_channel_json(cc, self_user_id):
 		else:
 			name = ', '.join(name for name, uid, user in names) or f'DM {cc.id}'
 			if len(name) > 100: name = name[:99] + '…'
+	if guild_id is None and cc.ct == DiscordSession.c_chan_type.private_group:
+		channel_icon_url = discord_channel_icon_url(cc)
 	return json.dumps(dict(
 		v=1, guild_id=guild_id, guild_name=None if guild_id is None else gg.get('name'),
 		channel_id=str(cc.id), channel_type=int(cc.ct),
@@ -3927,6 +3936,7 @@ class DiscordSession:
 				ct=cc_type, parent_id=c.get('parent_id') if c_tid else None,
 				private=cc_private, pos=c.get('position', -1)+1,
 				tags=tags, last_msg_ts=self.discord.flake_parse(c.get('last_message_id')) )
+			if 'icon' in c: cc.icon = c.icon
 			chans_updated[c.id] = cc
 		return chans_updated, new_threads
 

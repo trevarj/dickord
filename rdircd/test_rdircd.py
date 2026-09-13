@@ -144,6 +144,21 @@ class AvatarURLTests(unittest.TestCase):
         self.assertIsNone(rdircd.discord_guild_icon_url({"id": "10"}))
         self.assertIsNone(rdircd.discord_guild_icon_url({"id": "x", "icon": "abcd"}))
 
+    def test_channel_icon_urls_fail_closed_on_missing_or_invalid_data(self):
+        for channel in (
+            None,
+            {"id": "30"},
+            {"id": "30", "icon": None},
+            {"icon": "abcd"},
+            {"id": "30/31", "icon": "abcd"},
+            {"id": "３０", "icon": "abcd"},
+            {"id": "30", "icon": 123},
+            {"id": "30", "icon": ""},
+            {"id": "30", "icon": "../abcd"},
+        ):
+            with self.subTest(channel=channel):
+                self.assertIsNone(rdircd.discord_channel_icon_url(channel))
+
 
 class AttachmentTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -480,6 +495,7 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
                     descriptor["guild_icon_url"],
                     "https://cdn.discordapp.com/icons/10/abcd.png?size=256",
                 )
+                self.assertIsNone(descriptor["channel_icon_url"])
 
     def test_direct_dm_name_excludes_self_and_ignores_irc_user_alias(self):
         del self.discord.user_name
@@ -513,7 +529,7 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
             "avatar": "a_ab12", "discriminator": "0",
         }
         channel = self.process_channel(
-            self.session.st_da.me, id="30", type=1, name=None, recipients=[peer],
+            self.session.st_da.me, id="30", type=1, name=None, recipients=[peer], icon="abcd",
         )
         self.protocol.cmd_channel_metadata("#test", channel)
         self.assertEqual(
@@ -564,12 +580,84 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(channel_type=channel_type, name=name):
                     channel = self.process_channel(
                         self.session.st_da.me, id="30", type=channel_type,
-                        name=name, recipients=recipients,
+                        name=name, recipients=recipients, icon="a_ab12",
                     )
                     descriptor = rdircd.json.loads(rdircd.discord_channel_json(channel, "7"))
                     self.assertEqual(descriptor["channel_name"], expected)
-                    self.assertIsNone(descriptor["channel_icon_url"])
+                    self.assertEqual(
+                        descriptor["channel_icon_url"],
+                        "https://cdn.discordapp.com/channel-icons/30/a_ab12.png?size=256"
+                        if channel_type == 3 else None,
+                    )
                     recipients.reverse()
+
+    async def test_group_icon_events_and_repeated_joins_refresh_metadata_without_chatter(self):
+        self.conf.irc_chan_private = "fixed.{id}"
+        self.conf._irc_nick_sys = self.conf.irc_nick_sys
+        self.conf._irc_topic_hide_tags = set()
+        self.conf.watch = rdircd.adict_rev()
+        guild = self.session.st_da.me
+        guild.update(kh="me", ts_joined=0)
+        self.session.st_da.guilds = rdircd.adict({1: guild})
+        channel = self.process_channel(
+            guild, id="30", type=3, name="Team release", icon="abcd",
+            recipients=[{"id": "8", "username": "alice", "avatar": "ffff"}],
+        )
+        self.bridge.server_host = "rdircd"
+        self.bridge.server_ts = rdircd.dt.datetime.fromtimestamp(0, rdircd.dt.timezone.utc)
+        self.bridge.conn_id = 1
+        self.bridge.irc_conns = {"bridge": self.protocol}
+        self.bridge.irc_chans_sys = rdircd.adict()
+        self.bridge.st_br.update(
+            chan_map=None, uid={}, gid_mon_chan={}, gid_nc_chan={}, gid_vc_chan={},
+        )
+        self.discord.st_eris.online = True
+        self.protocol.bridge = self.bridge
+        scheduled = []
+        self.bridge.cmd_delay = lambda _delay, callback: scheduled.append(callback)
+        channel_map = self.bridge.cmd_chan_map()
+        name = self.bridge.st_br.did_chan[channel.did]
+        self.protocol.st_irc.chans = {
+            name: rdircd.adict(topic=channel_map[name].topic, cc=channel),
+        }
+        self.protocol.st_irc.ts_watch = 123
+        self.protocol.cmd_channel_metadata(name, channel)
+        expected = rdircd.json.loads(self.frames()[0].tags["+dickord/channel"])
+        initial_icon = "https://cdn.discordapp.com/channel-icons/30/abcd.png?size=256"
+        replaced_icon = "https://cdn.discordapp.com/channel-icons/30/ef01.png?size=256"
+        self.assertEqual(expected["channel_icon_url"], initial_icon)
+        scheduled.clear()
+
+        for fields, icon_url, changed in (
+            ({}, initial_icon, False),
+            ({"icon": "ef01"}, replaced_icon, True),
+            ({"icon": "ef01"}, replaced_icon, False),
+            ({}, replaced_icon, False),
+            ({"icon": None}, None, True),
+            ({}, None, False),
+        ):
+            with self.subTest(fields=fields, icon_url=icon_url):
+                self.wire.clear()
+                self.session.op_ev_chans(1, rdircd.adict(id="30", type=3, **fields))
+                while scheduled:
+                    await scheduled.pop(0)()
+                expected["channel_icon_url"] = icon_url
+                frames = self.frames()
+                self.assertEqual([frame.cmd for frame in frames], ["tagmsg"] if changed else [])
+                if changed:
+                    self.assertEqual(frames[0].params, [f"#{name}"])
+                    self.assertEqual(
+                        rdircd.json.loads(frames[0].tags["+dickord/channel"]), expected,
+                    )
+
+                self.wire.clear()
+                self.protocol.cmd_join(f"#{name}", cm=self.bridge.cmd_chan_map())
+                frames = self.frames()
+                self.assertEqual([frame.cmd for frame in frames], ["tagmsg"])
+                self.assertEqual(
+                    rdircd.json.loads(frames[0].tags["+dickord/channel"]), expected,
+                )
+                self.assertEqual(self.protocol.st_irc.ts_watch, 123)
 
     def test_only_derived_group_title_is_truncated_by_unicode_code_points(self):
         del self.discord.user_name
