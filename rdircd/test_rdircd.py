@@ -864,6 +864,26 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(frame.tags["+dickord/event"], "edit")
         self.assertEqual(frame.params[1], self.conf.irc_prefix_edit + self.conf.irc_prefix_attachment + url)
 
+    def test_voice_attachment_refresh_requires_an_edit_timestamp(self):
+        url = "https://cdn.discordapp.com/attachments/10/20/voice.ogg"
+        for metadata, timestamps in (
+            ({"duration_secs": 1.25}, {}),
+            ({"waveform": "AQI="}, {"edited_timestamp": None}),
+        ):
+            with self.subTest(metadata=metadata, timestamps=timestamps):
+                message = self.message(
+                    attachments=[{"url": url, **metadata}], **timestamps,
+                )
+                self.session.op_msg(message, "update")
+                self.assertEqual(self.wire, [])
+
+        message.edited_timestamp = "2026-09-18T12:00:00+00:00"
+        self.session.op_msg(message, "update")
+        frame, = self.frames()
+        self.assertEqual(frame.tags["+dickord/attachment"], url)
+        self.assertEqual(frame.tags["+dickord/event"], "edit")
+        self.assertEqual(frame.params[1], self.conf.irc_prefix_edit + self.conf.irc_prefix_attachment + url)
+
     def test_attachment_limits_fall_back_without_duplicate_upload_frames(self):
         url = "https://cdn.discordapp.com/attachments/10/20/photo.png?hm="
         for attachment, prefix in (

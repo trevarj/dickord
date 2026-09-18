@@ -4087,6 +4087,10 @@ class DiscordSession:
 		if msg_is_update := act == 'update':
 			# Sometimes discord sends completely empty msg-updates
 			if not set(m).difference(['id', 'flags', 'channel_id', 'guild_id']): return
+			# Voice attachment metadata refreshes are not user edits.
+			if not m.get('edited_timestamp') and any(
+					'duration_secs' in att or 'waveform' in att
+					for att in (m.get('attachments') or ()) ): return
 			td = old_skip.get(['update', 'poll'][any(
 				em.get('type') == 'poll_result' for em in (m.get('embeds') or list()) )])
 			if td and ts - msg_ts > td: return self.log.debug(
