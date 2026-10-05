@@ -11,6 +11,7 @@ loader = importlib.machinery.SourceFileLoader("dickord_rdircd", str(path))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 rdircd = importlib.util.module_from_spec(spec)
 loader.exec_module(rdircd)
+rdircd.aiohttp = __import__("aiohttp")
 
 
 class Log:
@@ -1417,19 +1418,24 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(timeout.sock_read, 40)
         self.assertEqual(timeout.sock_connect, 30)
 
-    async def test_raw_response_is_consumed_and_released(self):
+    async def test_raw_response_is_consumed_released_and_uses_client_headers(self):
         session = self.make_session()
         response = Response(status=204)
+        requests = []
 
         class HTTP:
-            async def request(self, *_args, **_kwargs):
+            async def request(self, *_args, **kwargs):
+                requests.append(kwargs)
                 return response
 
-        session.ws = rdircd.adict(http=HTTP())
+        session.ws = rdircd.adict(http=HTTP(), client_props_hdr="props")
         result = await session.req("channels/123/typing", m="post", auth=False, raw=True)
         self.assertIsNone(result)
         self.assertTrue(response.read_called)
         self.assertTrue(response.released)
+        self.assertEqual(requests[0]["headers"], {
+            "User-Agent": "test", "X-Super-Properties": "props",
+        })
 
     async def test_manual_token_401_stops_without_retry(self):
         session = self.make_session()
@@ -1442,7 +1448,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                 calls += 1
                 return response
 
-        session.ws = rdircd.adict(http=HTTP())
+        session.ws = rdircd.adict(http=HTTP(), client_props_hdr=None)
         session.req_auth_token = mock.AsyncMock(return_value="token")
         with self.assertRaises(rdircd.DiscordSessionError):
             await session.req("users/@me")
@@ -1458,7 +1464,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             async def request(self, *_args, **_kwargs):
                 return responses.pop(0)
 
-        session.ws = rdircd.adict(http=HTTP())
+        session.ws = rdircd.adict(http=HTTP(), client_props_hdr=None)
         session.auth_token = "old"
         session.req_auth_token = mock.AsyncMock(side_effect=["old", "new"])
         result = await session.req("users/@me")
@@ -1511,7 +1517,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                 bodies.append(kwargs["data"])
                 return responses.pop(0)
 
-        session.ws = rdircd.adict(http=HTTP())
+        session.ws = rdircd.adict(http=HTTP(), client_props_hdr=None)
         factory = mock.Mock(side_effect=[object(), object()])
         result = await session.req(
             "channels/123/messages", m="post", auth=False, data_factory=factory,
@@ -1533,6 +1539,16 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         session.ws_enabled = True
         session.state = lambda state: session.st_da.update(state=state)
         return session
+
+    def test_unknown_guild_typing_event_is_dropped(self):
+        session = self.make_session()
+        session.st_da.guilds = {}
+        session.log = mock.Mock()
+        session.op_typing(rdircd.adict(guild_id="404", channel_id="7"))
+        session.log.warning.assert_called_once_with(
+            "Dropped typing event with unknown guild/channel id:"
+            " guild_id={} channel_id={}", "404", "7",
+        )
 
     def test_close_codes_choose_resume_reidentify_backoff_or_stop(self):
         session = self.make_session()

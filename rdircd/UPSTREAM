@@ -1,5 +1,5 @@
 Source: https://github.com/mk-fg/reliable-discord-client-irc-daemon
-Commit: bcb5438afd1ee38191045284c157c0124cf3d655
-Version: 26.07.2
+Commit: 57e2307fae006142953967084852278a859bac60
+Version: 26.09.3
 
 Dickord carries this source as an owned fork. Local changes are tracked directly in this repository.

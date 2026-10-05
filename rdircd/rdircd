@@ -12,8 +12,6 @@ import asyncio, socket, signal, inspect, configparser, tempfile, fnmatch
 import pickle, hashlib, base64, binascii, random, textwrap, unicodedata, string, ast
 import logging, logging.handlers
 
-import aiohttp # https://aiohttp.readthedocs.io/
-
 
 class RDIRCDConfigBase:
 	# This is a regular ini file with key=value lines under couple sections and ;-comments.
@@ -28,7 +26,7 @@ class RDIRCDConfigBase:
 	#  for example: 1/4:5 (interval=0.25s, rate=4/s, burst=5), 5 (burst=1), 0.5:10, 20:30,
 	#  and also special "0" value can be used as "no rate limit", or "inf" for "always block".
 
-	version = '26.07.2-dickord.3' # git-version: py-str
+	version = '26.09.3-dickord.3' # git-version: py-str
 
 	auth_email = '' # discord account email, used to login there
 	auth_password = ''
@@ -153,8 +151,9 @@ class RDIRCDConfigBase:
 
 	discord_auto_connect = True
 	discord_api_url = 'https://discord.com/api/v{api_ver}/'
-	discord_api_user_agent = ( f'rdircd/{version}'
-		f' (reliable-discord-irc-client) aiohttp/{aiohttp.__version__}' )
+	discord_api_user_agent = ( 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+		' AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' )
+	discord_api_user_agent_ver = '126.0.0.0'
 	discord_ws_conn_timeout = 20.0
 	discord_ws_heartbeat = 15.0
 	discord_ws_auth_timeout = 60.0 # reconnect websocket if auth process lags too badly
@@ -3168,12 +3167,13 @@ class DiscordSession:
 		if not self.ws: raise DiscordSessionError('Not connected to discord')
 		if not re.search(r'^https?:', url): url = up.urljoin(self.api_url, url.lstrip('/'))
 		if route is None: route = self.rate_limit_route(m, url)
-		kws.setdefault('headers', dict()).setdefault(
-			'User-Agent', self.conf.discord_api_user_agent )
+		(headers := kws.setdefault('headers', dict())) \
+			.setdefault('User-Agent', self.conf.discord_api_user_agent)
+		if hdr := self.ws.client_props_hdr: headers.setdefault('X-Super-Properties', hdr)
 		for att in 'normal', 'token_refresh':
 			if auth:
 				token = await self.req_auth_token()
-				kws.setdefault('headers', dict()).update(Authorization=token)
+				headers.update(Authorization=token)
 			async def req_func():
 				request_kws = kws.copy()
 				if data_factory: request_kws['data'] = data_factory()
@@ -3279,7 +3279,7 @@ class DiscordSession:
 		if self.conf.debug_proto_aiohttp:
 			aiohttp_opts.trace_configs = [setup_aiohttp_trace_logging(self.log_http_reqres)]
 		ws.http = await ws.enter_async_context(aiohttp.ClientSession(**aiohttp_opts))
-		ws.handlers, ws.nonces = dict(), dict()
+		ws.handlers, ws.nonces, ws.client_props_hdr = dict(), dict(), None
 		ws.callback(lambda: list(fut.cancel() for fut in ws.nonces.values()))
 		ws.conn_task = asyncio.current_task()
 		ws.callback(lambda: (t := ws.conn_task) and t.cancel('Connection aborted'))
@@ -3576,10 +3576,19 @@ class DiscordSession:
 			self.state('hello.auth.identify')
 			self.ws_add_handler( self.c.xi_dispatch,
 				t='ready', func=self.op_ready, replace=True )
+			# https://docs.discord.food/reference#client-properties
+			client_props = dict( # same order as browser sends
+				os='Linux', browser='Chrome', device='', system_locale='en-US',
+				browser_user_agent=self.conf.discord_api_user_agent,
+				browser_version=self.conf.discord_api_user_agent_ver,
+				os_version='', referrer='', referring_domain='',
+				referrer_current='', referring_domain_current='',
+				release_channel='stable', client_build_number=96355, client_event_source=None )
+			self.ws.client_props_hdr = \
+				base64.b64encode(json.dumps(client_props).encode()).decode()
 			# Note: sending API intents seem to strip "contents" from other people's messages!
 			self.ws_send(self.c.ox_identify, dict(
-				properties={'os': 'Linux', 'browser': 'rdircd', 'device': ''},
-				token=token, compress=False ))
+				properties=client_props, token=token, compress=False ))
 		else:
 			self.state('hello.auth.resume')
 			self.ws_add_handler( self.c.xi_dispatch,
@@ -4692,9 +4701,11 @@ class DiscordSession:
 			msg_base + ' '.join(sorted(ev)), dict(_ev='vc'), notice=True )
 
 	def op_typing(self, m):
-		if gg := self.st_da.guilds.get(m.get('guild_id', 1)): cc = gg.chans.get(m.channel_id)
+		gg = self.st_da.guilds.get(m.get('guild_id', 1))
+		cc = gg.chans.get(m.channel_id) if gg else None
 		if not cc: return self.log.warning( 'Dropped typing event with'
-			' unknown guild/channel id: guild_id={} channel_id={}', gg, m.channel_id )
+			' unknown guild/channel id: guild_id={} channel_id={}',
+			m.get('guild_id'), m.channel_id )
 		# These messages always have "user_id", but "member" only in non-private chats
 		# ws_req_users_query() can be used to get non-cached uid, but seems unnecessary
 		if nick := m.get('member'): nick = self.discord.user_name(nick)
@@ -6828,6 +6839,11 @@ def main(args=None, conf=None):
 			return log.error('Failed to reload config(s) on SIGHUP: {}', err_fmt(err))
 		conf_paths = ' '.join(path_names(*conf_paths))
 		log.debug('Reloaded config file(s) on SIGHUP [ {} ]', conf_paths)
+
+	global aiohttp
+	import aiohttp # https://aiohttp.readthedocs.io/ - required to run rdircd normally
+	if not conf.discord_api_user_agent: conf.discord_api_user_agent = (
+		f'rdircd/{conf.version} (reliable-discord-irc-client) aiohttp/{aiohttp.__version__}' )
 
 	async def _run_rdircd():
 		loop, rdircd = asyncio.get_running_loop(), RDIRCD(conf)
